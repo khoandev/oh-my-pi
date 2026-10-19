@@ -12,6 +12,7 @@ import {
 import eagerTasksTemplate from "./fixtures/system-prompt-template/eager-tasks.md" with { type: "text" };
 import literalDataTemplate from "./fixtures/system-prompt-template/literal-data.md" with { type: "text" };
 import liveDataTemplate from "./fixtures/system-prompt-template/live-data.md" with { type: "text" };
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const EMPTY_TREE = {
 	rootPath: "",
@@ -41,8 +42,8 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 	const previousConfigDir = process.env.PI_CONFIG_DIR;
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
-	delete process.env.PI_CODING_AGENT_DIR;
-	delete process.env.PI_CONFIG_DIR;
+	restoreEnvValue("PI_CODING_AGENT_DIR", undefined);
+	restoreEnvValue("PI_CONFIG_DIR", undefined);
 	__resetDirsFromEnvForTests();
 	try {
 		return await fn({
@@ -56,10 +57,8 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 		else process.env.USERPROFILE = previousUserProfile;
-		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-		if (previousConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
-		else process.env.PI_CONFIG_DIR = previousConfigDir;
+		restoreEnvValue("PI_CODING_AGENT_DIR", previousAgentDir);
+		restoreEnvValue("PI_CONFIG_DIR", previousConfigDir);
 		__resetDirsFromEnvForTests();
 	}
 }
