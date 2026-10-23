@@ -1,0 +1,96 @@
+name: Build OMP x64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64
+            binary: omp-linux-x64
+            native_targets: linux-x64-baseline linux-x64-modern
+
+          - os: macos-15-intel
+            target: darwin-x64
+            binary: omp-darwin-x64
+            native_targets: darwin-x64-baseline
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4"
+
+      - name: Cache Bun
+        uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-x64-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-x64-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Build native .node files directly.
+      # Không phụ thuộc artifact từ job khác.
+      - id: cache
+        uses: ./.github/actions/bazel-cache
+
+      - name: Build native addons
+        shell: bash
+        env:
+          OMP_BAZEL_RC: ${{ steps.cache.outputs.rc }}
+          NATIVE_TARGETS: ${{ matrix.native_targets }}
+        run: |
+          set -euo pipefail
+          # Raise-only fd guard: huge toolchain input trees exhaust low soft
+          # limits during sandbox setup. Runs in the step that launches the
+          # bazel server (limits are per-process and the server persists).
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          read -r -a targets <<< "$NATIVE_TARGETS"
+          bun scripts/bazel-natives.ts "${targets[@]}" --dest packages/natives/native
+
+      - name: Build ${{ matrix.target }}
+        env:
+          RELEASE_TARGETS: ${{ matrix.target }}
+        run: bun run ci:release:build-binaries
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -e
+          chmod +x packages/coding-agent/binaries/${{ matrix.binary }}
+
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" \
+          XDG_DATA_HOME="$runtime_dir/xdg" \
+          packages/coding-agent/binaries/${{ matrix.binary }} --version
+
+      - name: Upload ${{ matrix.target }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary }}
+          path: packages/coding-agent/binaries/${{ matrix.binary }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

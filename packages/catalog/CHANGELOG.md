@@ -130,6 +130,7 @@
 - Fixed `xai-oauth` Grok 4.20 models (`grok-4.20-0309-reasoning`, `-non-reasoning`, `grok-4.20-multi-agent-0309`) advertising a 2M context window when the SuperGrok API rejects prompts over 1M; auto-compaction and context usage now work from the 1M window ([#15443](https://github.com/can1357/oh-my-pi/pull/15443) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed trailing-dot `localhost.` and `*.local.` custom endpoints losing local-backend compatibility settings ([#15798](https://github.com/can1357/oh-my-pi/issues/15798)).
 
+- Fixed `withOpenCodeGateTools`: raised the gate threshold from 2 to 5 and pad with all missing tool names so advisor requests (carrying only `advise`) now include the full five-name roster the gateway requires.
 ## [18.11.0] - 2026-10-14
 
 ### Added
@@ -575,6 +576,18 @@
 
 ### Added
 
+- Added `buildDiscoveredModel` helper for custom providers
+- Added support for glob-based patterns in identity overrides
+- Added `wire/opencode` helpers (`OPENCODE_USER_AGENT`, `toOpenCodeSessionToken`, `OPENCODE_SESSION_TOKEN_PATTERN`, `OPENCODE_GATE_TOOL_NAMES`, `withOpenCodeGateTools`) for the OpenCode gateway client-identity and free-tier body-gate contracts ([#12556](https://github.com/can1357/oh-my-pi/pull/12556) by [@palprateek](https://github.com/palprateek))
+
+### Changed
+
+- Centralized llama.cpp Qwen routing and thinking policy in KDL, with reviewed Bonsai lineage aliases and shared backend policy for custom provider names.
+- OpenCode Go/Zen live model discovery and usage polls now attribute with the canonical OpenCode client identity (`opencode/*` User-Agent + canonical `ses_` session token) instead of omp's UA and raw install id.
+
+### Fixed
+
+- Fixed OpenCode free-tier 403 (`FreeTierError`) on tool-less auxiliary calls: all OpenCode traffic now carries the client identity the gateway's gate requires.
 - Expanded OpenRouter provider support with embedding, reranking, video generation, text-to-speech, and speech-to-text capabilities, including five new speech-to-text models.
 - Added speech-to-text support to the OpenAI provider.
 
