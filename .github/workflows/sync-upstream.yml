@@ -31,13 +31,13 @@ jobs:
       - name: Add upstream remote
         run: git remote add upstream https://github.com/can1357/oh-my-pi.git
 
-      - name: Merge upstream/master into master
+      - name: Merge upstream/main into master
         run: |
-          git fetch upstream master --tags
-          if git merge --no-edit upstream/master; then
-            echo "Merged upstream/master (fast-forward hoặc merge sạch)."
+          git fetch upstream main --tags
+          if git merge --no-edit upstream/main; then
+            echo "Đã merge upstream/main vào master (fast-forward hoặc merge sạch)."
           else
-            echo "::error::Merge conflict với upstream/master — cần resolve thủ công."
+            echo "::error::Merge conflict với upstream/main — cần resolve thủ công."
             git merge --abort
             exit 1
           fi
