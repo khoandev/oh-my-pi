@@ -1,0 +1,48 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # GitHub Actions có jitter nên cron */15 sẽ chạy trễ vài phút mỗi lần.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream/master into master
+        run: |
+          git fetch upstream master --tags
+          if git merge --no-edit upstream/master; then
+            echo "Merged upstream/master (fast-forward hoặc merge sạch)."
+          else
+            echo "::error::Merge conflict với upstream/master — cần resolve thủ công."
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push to origin
+        run: |
+          if [ "$(git rev-list --count origin/master..master)" -gt 0 ]; then
+            git push origin master
+          else
+            echo "Đã đồng bộ, không có commit mới để push."
+          fi
