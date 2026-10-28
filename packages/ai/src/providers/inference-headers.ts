@@ -3,7 +3,9 @@
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { isOpenCodeProvider, OPENCODE_USER_AGENT, toOpenCodeSessionToken } from "@oh-my-pi/pi-catalog/wire/opencode";
-import { APP_NAME, APP_URL, getInstallId, USER_AGENT } from "@oh-my-pi/pi-utils";
+import { APP_NAME, APP_URL, getInstallId, prompt, USER_AGENT } from "@oh-my-pi/pi-utils";
+export { OPENCODE_USER_AGENT };
+import openCodeEnvTemplate from "./opencode-env.md" with { type: "text" };
 
 /** Options controlling provider and protocol inference headers. */
 export interface InferenceHeaderOptions {
@@ -29,6 +31,8 @@ export interface InferenceHeaderOptions {
 	 * protocol-native session headers and every other backend keep `sessionId`.
 	 */
 	cacheAffinity?: string;
+	/** Whether the model route requires OpenCode client headers and session format. */
+	requiresOpenCodeClient?: boolean;
 }
 
 /**
@@ -90,6 +94,19 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
 	headers[name] = value;
 }
 
+
+/** Ensures the system prompt contains the environment working directory block required by OpenCode gateway. */
+export function ensureOpenCodeSystemPrompt(prompts: string[], cwd?: string): string[] {
+	if (prompts.some(p => p.includes("<env>") && p.includes("Working directory:"))) {
+		return prompts;
+	}
+	const envBlock = prompt.render(openCodeEnvTemplate, { cwd: cwd ?? process.cwd() }).trim();
+	if (prompts.length === 0) {
+		return [envBlock];
+	}
+	return [...prompts, envBlock];
+}
+
 /**
  * Project omp's identity and authoritative conversation id onto the headers
  * understood by the active inference protocol and host.
@@ -104,7 +121,6 @@ export function applyInferenceHeaders(headers: Record<string, string>, options: 
 		setHeaderIfAbsent(headers, "http-referer", APP_URL);
 		setHeaderIfAbsent(headers, "x-title", APP_NAME);
 	}
-
 	const isOpenCode = isOpenCodeProvider(backend);
 	const sessionId = options.sessionId;
 	// The conversation id and the explicit cache key are independently
@@ -112,6 +128,7 @@ export function applyInferenceHeaders(headers: Record<string, string>, options: 
 	// conversation session in hand (V1 compaction, direct client-options
 	// builds). OpenCode gateways still need the header shape on conversation-less
 	// background traffic, so only non-OpenCode lanes may return early.
+	const requiresClient = isOpenCode && backend === "opencode-zen" && options.requiresOpenCodeClient;
 	if (!sessionId && !options.cacheAffinity && !isOpenCode) return;
 
 	if (sessionId) {
@@ -124,19 +141,27 @@ export function applyInferenceHeaders(headers: Record<string, string>, options: 
 	}
 
 	if (isOpenCode) {
-		// The free-tier gate reads the UA's leading token before anything else;
-		// only an explicit caller override (e.g. a Claude OAuth fingerprint) wins.
-		setHeaderIfAbsent(headers, "User-Agent", OPENCODE_USER_AGENT);
-		// Go's session header doubles as the gateway's cache-affinity handle:
-		// opted-in sibling lanes (see resolveOpenCodeGoCacheAffinity) share one
-		// task cache key there; every other lane keeps the conversation id.
-		const goSession = backend === "opencode-go" ? (options.cacheAffinity ?? sessionId) : sessionId;
-		if (goSession) {
-			setHeader(headers, "x-opencode-session", toOpenCodeSessionToken(goSession));
+		if (requiresClient) {
+			// The free-tier gate reads the UA's leading token before anything else;
+			// only an explicit caller override (e.g. a Claude OAuth fingerprint) wins.
+			if (!headers["User-Agent"] || !headers["User-Agent"].startsWith("claude-cli/")) {
+				setHeaderIfAbsent(headers, "User-Agent", `${OPENCODE_USER_AGENT} (${USER_AGENT})`);
+			}
+			setHeader(headers, "x-opencode-client", "cli");
+			setHeader(headers, "x-opencode-session", toOpenCodeSessionToken(sessionId ?? getInstallId()));
 		} else {
-			// Background traffic outside any conversation (usage polls, model
-			// discovery) still has to carry the session header shape.
-			setHeaderIfAbsent(headers, "x-opencode-session", toOpenCodeSessionToken(getInstallId()));
+			setHeaderIfAbsent(headers, "User-Agent", OPENCODE_USER_AGENT);
+			// Go's session header doubles as the gateway's cache-affinity handle:
+			// opted-in sibling lanes (see resolveOpenCodeGoCacheAffinity) share one
+			// task cache key there; every other lane keeps the conversation id.
+			const goSession = backend === "opencode-go" ? (options.cacheAffinity ?? sessionId) : sessionId;
+			if (goSession) {
+				setHeader(headers, "x-opencode-session", toOpenCodeSessionToken(goSession));
+			} else {
+				// Background traffic outside any conversation (usage polls, model
+				// discovery) still has to carry the session header shape.
+				setHeaderIfAbsent(headers, "x-opencode-session", toOpenCodeSessionToken(getInstallId()));
+			}
 		}
 	}
 }

@@ -9,7 +9,7 @@
  */
 
 /** Canonical OpenCode client User-Agent; the gate reads only the leading token. */
-export const OPENCODE_USER_AGENT = "opencode/1.18.31";
+export const OPENCODE_USER_AGENT = "opencode/1.19.3";
 
 /** Provider ids whose hosts sit behind the OpenCode gateways (Zen, Go). */
 export const OPENCODE_PROVIDER_IDS: ReadonlySet<string> = new Set(["opencode-zen", "opencode-go"]);

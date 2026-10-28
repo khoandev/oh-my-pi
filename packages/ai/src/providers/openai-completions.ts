@@ -127,6 +127,7 @@ import {
 	joinTextWithImagePlaceholder,
 	NON_VISION_IMAGE_PLACEHOLDER,
 } from "./vision-guard";
+import { ensureOpenCodeSystemPrompt } from "./inference-headers";
 
 export { applyOpenRouterRoutingVariant } from "./openai-shared";
 
@@ -2210,7 +2211,7 @@ function buildParams(
 		hasTools: Array.isArray(params.tools) && params.tools.length > 0,
 	});
 	const compat = finalPolicy.compat as ResolvedOpenAICompat;
-	const messages = convertMessages(model, context, compat);
+	const messages = convertMessages(model, context, compat, options?.cwd);
 	maybeAddAnthropicCacheControl(compat, messages);
 	params.messages = messages;
 	const outputToken = resolveOpenAIOutputTokenParam({
@@ -2370,6 +2371,7 @@ export function convertMessages(
 	model: Model<"openai-completions">,
 	context: Context,
 	compat: ResolvedOpenAICompat,
+	cwd?: string,
 ): ChatCompletionMessageParam[] {
 	const params: ChatCompletionMessageParam[] = [];
 
@@ -2440,7 +2442,10 @@ export function convertMessages(
 		return generateFallbackToolCallId(seed);
 	};
 
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	const normalizedPrompts = normalizeSystemPrompts(context.systemPrompt);
+	const systemPrompts = compat.requiresOpenCodeEnvironment
+		? ensureOpenCodeSystemPrompt(normalizedPrompts, cwd)
+		: normalizedPrompts;
 	if (systemPrompts.length > 0) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
 		const role = useDeveloperRole ? "developer" : "system";

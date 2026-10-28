@@ -154,7 +154,7 @@ import {
 import { prepareAnthropicImageContext } from "./anthropic-images";
 import { isAnthropicNarrationSignature, servedModelFromAnthropicSignature } from "./anthropic-signature";
 import { getOpenAIPromptCacheKey } from "./openai-shared";
-import { applyInferenceHeaders } from "./inference-headers";
+import { applyInferenceHeaders, ensureOpenCodeSystemPrompt } from "./inference-headers";
 import { isAnthropicMessagesModel, redactSensitiveCredentials, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 import {
@@ -4279,6 +4279,8 @@ type SystemBlockOptions = {
 	 * Distinct from an undefined `cacheControl`, which only means "default".
 	 */
 	dropCacheControl?: boolean;
+	requiresOpenCodeEnvironment?: boolean;
+	cwd?: string;
 };
 
 export function buildAnthropicSystemBlocks(
@@ -4292,7 +4294,10 @@ export function buildAnthropicSystemBlocks(
 		cacheControl,
 		dropCacheControl = false,
 	} = options;
-	const sanitizedPrompts = normalizeSystemPrompts(systemPrompt);
+	const normalizedPrompts = normalizeSystemPrompts(systemPrompt);
+	const sanitizedPrompts = options.requiresOpenCodeEnvironment
+		? ensureOpenCodeSystemPrompt(normalizedPrompts, options.cwd)
+		: normalizedPrompts;
 	const trimmedInstructions = extraInstructions.map(instruction => instruction.trim()).filter(Boolean);
 	const hasBillingHeader = sanitizedPrompts.some(prompt => prompt.startsWith(CLAUDE_BILLING_HEADER_PREFIX));
 
@@ -4427,6 +4432,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			providerType: model.providerType,
 			protocol: "anthropic",
 			sessionId,
+			requiresOpenCodeClient: model.compat.requiresOpenCodeEnvironment,
 		});
 
 		return {
@@ -4499,6 +4505,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		providerType: model.providerType,
 		protocol: "anthropic",
 		sessionId,
+		requiresOpenCodeClient: model.compat.requiresOpenCodeEnvironment,
 	});
 
 	if (model.provider === "cloudflare-ai-gateway") {
@@ -5541,6 +5548,8 @@ function buildParams(
 		firstUserMessageText,
 		cacheControl,
 		dropCacheControl,
+		requiresOpenCodeEnvironment: model.compat.requiresOpenCodeEnvironment,
+		cwd: options?.cwd,
 	});
 
 	// An on-demand compaction request ends inside the conversation: it gets
