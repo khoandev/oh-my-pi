@@ -4,7 +4,6 @@ import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { isOpenCodeProvider, OPENCODE_USER_AGENT, toOpenCodeSessionToken } from "@oh-my-pi/pi-catalog/wire/opencode";
 import { APP_NAME, APP_URL, getInstallId, prompt, USER_AGENT } from "@oh-my-pi/pi-utils";
-export { OPENCODE_USER_AGENT };
 import openCodeEnvTemplate from "./opencode-env.md" with { type: "text" };
 
 /** Options controlling provider and protocol inference headers. */
@@ -93,7 +92,6 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
 	}
 	headers[name] = value;
 }
-
 
 /** Ensures the system prompt contains the environment working directory block required by OpenCode gateway. */
 export function ensureOpenCodeSystemPrompt(prompts: string[], cwd?: string): string[] {

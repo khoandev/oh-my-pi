@@ -1,11 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { applyInferenceHeaders, ensureOpenCodeSystemPrompt, OPENCODE_USER_AGENT } from "../src/providers/inference-headers";
+import { applyInferenceHeaders, ensureOpenCodeSystemPrompt } from "../src/providers/inference-headers";
 import { resolveOpenAIRequestSetup } from "../src/providers/openai-shared";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamAnthropic } from "../src/providers/anthropic";
 import { USER_AGENT } from "@oh-my-pi/pi-utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { toOpenCodeSessionToken } from "@oh-my-pi/pi-catalog/wire/opencode";
+import { OPENCODE_USER_AGENT } from "@oh-my-pi/pi-catalog/wire/opencode";
 import type { FetchImpl } from "../src/types";
 
 const OPENCODE_ZEN_DEEPSEEK_FREE_MODEL = buildModel({
