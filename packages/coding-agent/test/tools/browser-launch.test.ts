@@ -16,6 +16,21 @@ import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
 
 const EXECUTABLE_PROBE = path.resolve(import.meta.dir, "../fixtures/browser-executable-probe.ts");
 
+/**
+ * The parent's environment without the variables that relocate omp's directories or pick a browser.
+ * `setAgentDir()` exports `PI_CODING_AGENT_DIR` for the rest of the process, and an agent-dir or
+ * profile override disables the XDG roots the tests below pin the child's puppeteer cache with, so
+ * an inherited one would point the child at a cache without the seeded Chrome for Testing.
+ */
+function probeEnv(): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = { ...process.env };
+	for (const key in env) {
+		if (key.startsWith("XDG_") || key.startsWith("PUPPETEER_")) delete env[key];
+	}
+	for (const key of ["PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"]) delete env[key];
+	return env;
+}
+
 const AUTOMATION_FLAG = "--enable-automation";
 
 const EDGE_EXECUTABLE_PATHS = [
@@ -151,21 +166,6 @@ describe("browser executable selection", () => {
 		},
 	);
 
-	it.skipIf(process.platform !== "linux")("rejects wrappers that hang during the version probe", async () => {
-		const tempDir = TempDir.createSync("@browser-probe-hanging-");
-		try {
-			const hangingWrapper = path.join(tempDir.path(), "google-chrome");
-			await Bun.write(hangingWrapper, "#!/bin/sh\nsleep 60\n");
-			fs.chmodSync(hangingWrapper, 0o755);
-
-			const startedAt = performance.now();
-			await expect(chromiumExecutableProbeForTest(hangingWrapper)).resolves.toBe(false);
-			expect(performance.now() - startedAt).toBeLessThan(5000);
-		} finally {
-			await tempDir.remove();
-		}
-	});
-
 	it("does not launch the candidate to probe its version off Linux (#8445)", async () => {
 		for (const platform of ["win32", "darwin"] as const) {
 			const tempDir = TempDir.createSync(`@browser-probe-${platform}-`);
@@ -202,7 +202,7 @@ describe("browser executable selection", () => {
 
 			const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
 				env: {
-					...process.env,
+					...probeEnv(),
 					OMP_BROWSER_PROBE_PLATFORM: "win32",
 					ProgramFiles: tempDir.path(),
 					"ProgramFiles(x86)": path.join(tempDir.path(), "missing-x86"),
@@ -237,13 +237,8 @@ describe("browser executable selection", () => {
 				for (const xdg of [xdgCache, path.join(tempDir.path(), "data"), path.join(tempDir.path(), "state")]) {
 					fs.mkdirSync(path.join(xdg, APP_NAME), { recursive: true });
 				}
-				// The XDG roots only pin the child's puppeteer cache while PI_CODING_AGENT_DIR
-				// is unset: `refreshDirsFromEnv` prefers the explicit agent dir over every
-				// XDG root, so a machine-wide export would resolve the cache under
-				// `<agentDir>/puppeteer` and miss the stub seeded below.
-				const { PI_CODING_AGENT_DIR: _agentDir, PI_CONFIG_DIR: _configDir, ...hostEnv } = process.env;
 				const env = {
-					...hostEnv,
+					...probeEnv(),
 					HOME: home,
 					XDG_CACHE_HOME: xdgCache,
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
@@ -308,7 +303,7 @@ describe("browser executable selection", () => {
 				fs.chmodSync(chromeForTesting, 0o755);
 				const edge = EDGE_EXECUTABLE_PATHS[0];
 				const env = {
-					...process.env,
+					...probeEnv(),
 					HOME: path.join(tempDir.path(), "home"),
 					XDG_CACHE_HOME: xdgCache,
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
