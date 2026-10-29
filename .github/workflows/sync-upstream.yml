@@ -8,6 +8,9 @@ on:
 
 permissions:
   contents: write
+  # Push bằng GITHUB_TOKEN không kích hoạt workflow khác (chống đệ quy),
+  # nên cần quyền này để dispatch build-omp-x64 thủ công sau khi sync.
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -43,9 +46,20 @@ jobs:
           fi
 
       - name: Push to origin
+        id: push
         run: |
           if [ "$(git rev-list --count origin/master..master)" -gt 0 ]; then
             git push origin master
+            echo "did_push=true" >> "$GITHUB_OUTPUT"
           else
             echo "Đã đồng bộ, không có commit mới để push."
+            echo "did_push=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # Push bằng GITHUB_TOKEN không tự kích hoạt on: push workflow khác
+      # (GitHub chống đệ quy), nên dispatch trực tiếp khi vừa có commit mới.
+      - name: Trigger build x64
+        if: steps.push.outputs.did_push == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-omp-x64.yml --repo "$GITHUB_REPOSITORY" --ref master
