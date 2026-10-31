@@ -600,8 +600,6 @@ export interface OpenAICompat {
 	stripImageInput?: boolean;
 	/** Whether the gateway requires an `<env>` working directory block in the system prompt. */
 	requiresOpenCodeEnvironment?: boolean;
-	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
-	thinkingLoopGuard?: "gemini" | "deepseek" | "xai";
 }
 
 /**
@@ -802,8 +800,6 @@ export interface AnthropicCompat {
 	 * contract override it. Default: 10485760.
 	 */
 	maxImagePayloadBytes?: number;
-	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
-	thinkingLoopGuard?: "gemini" | "deepseek" | "xai";
 	/**
 	 * Drop the enabled `thinking` config and replayed thinking blocks when the
 	 * conversation is not thinking-led (a proxy contract for non-interleaved
@@ -1021,8 +1017,6 @@ export interface ResolvedOpenAISharedCompat {
 	stripImageInput: boolean;
 	/** Whether the gateway requires an `<env>` working directory block in the system prompt. */
 	requiresOpenCodeEnvironment?: boolean;
-	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
-	thinkingLoopGuard?: OpenAICompat["thinkingLoopGuard"];
 	/** Flatten/reject leftover root `anyOf`/`oneOf` unions in strict tool schemas (xAI's function-calling validator 400s on them). */
 	rejectRootObjectUnion: boolean;
 	/** Retry without strict tools when the host rejects a strict grammar as too large (OpenRouter-Anthropic compiled-grammar overflow). */
@@ -1106,7 +1100,6 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "supportsSteering"
 			| "stripImageInput"
 			| "requiresOpenCodeEnvironment"
-			| "thinkingLoopGuard"
 			| "whenThinking"
 		>
 	> & {
@@ -1208,7 +1201,6 @@ export type ResolvedAnthropicCompat = Required<
 	Omit<
 		AnthropicCompat,
 		| "streamIdleTimeoutMs"
-		| "thinkingLoopGuard"
 		| "bedrockMessagesApi"
 		| "effortBeta"
 		| "extendedCacheTtlBeta"
@@ -1245,8 +1237,6 @@ export type ResolvedAnthropicCompat = Required<
 	 * request builder.
 	 */
 	maxImagePayloadBytes?: number;
-	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
-	thinkingLoopGuard?: AnthropicCompat["thinkingLoopGuard"];
 	/**
 	 * Bedrock's Anthropic Messages API (see {@link AnthropicCompat.bedrockMessagesApi}).
 	 * `true` when detected or configured; otherwise unset, so rows baked before
@@ -1348,8 +1338,6 @@ export interface GoogleCompat {
 	 * {@link AnthropicCompat.maxImagePayloadBytes}).
 	 */
 	maxImagePayloadBytes?: number;
-	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
-	thinkingLoopGuard?: "gemini" | "deepseek" | "xai";
 	/** See {@link BedrockCompat.supportsSamplingParams}. */
 	supportsSamplingParams?: boolean;
 }
@@ -1360,7 +1348,6 @@ export type ResolvedGoogleCompat = Required<
 		GoogleCompat,
 		| "streamFirstEventTimeoutMs"
 		| "streamIdleTimeoutMs"
-		| "thinkingLoopGuard"
 		| "antigravityUsageLabel"
 		| "supportsSamplingParams"
 		| "maxImageDimension"
@@ -1369,7 +1356,6 @@ export type ResolvedGoogleCompat = Required<
 > & {
 	streamFirstEventTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
-	thinkingLoopGuard?: GoogleCompat["thinkingLoopGuard"];
 	antigravityUsageLabel?: string;
 	supportsSamplingParams?: boolean;
 	maxImageDimension?: number;

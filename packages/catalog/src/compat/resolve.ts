@@ -605,7 +605,6 @@ function detectOpenAICompat(
 		clampOutputToModelMax: d.isLocalOpenAICompatBackend,
 		stripImageInput: false,
 		requiresOpenCodeEnvironment: false,
-		thinkingLoopGuard: undefined,
 		rejectRootObjectUnion: false,
 		retryWithoutStrictOnGrammarError: false,
 		supportsPromptCacheKey: false,
@@ -764,7 +763,6 @@ function resolveOpenAIResponsesPolicy(
 		requiresReasoningOffJuiceInstruction: false,
 		stripImageInput: false,
 		requiresOpenCodeEnvironment: false,
-		thinkingLoopGuard: undefined,
 		reasoningEffortMap: {},
 		supportsReasoningParams: true,
 		supportsSamplingParams: true,
@@ -939,7 +937,6 @@ function resolveAnthropicPolicy(
 		// user-authored `compat` block to override them.
 		maxImageDimension: undefined,
 		maxImagePayloadBytes: undefined,
-		thinkingLoopGuard: undefined,
 		// Present as keys so models.yml `compat` can set them; unset unless a rule assigns them.
 		stripThinkingHistory: undefined,
 		fastMode: undefined,
