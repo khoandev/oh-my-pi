@@ -15,7 +15,7 @@
 
 ### Fixed
 
-- Local ONNX models load on Intel Macs again: inference side runtimes pin `onnxruntime-node` 1.21.0, the last release whose prebuilt macOS x64 binary loads on macOS 12, instead of failing with `Cannot find module '../bin/napi-v6/darwin/x64/onnxruntime_binding.node'`; the `q4` tiny-title exports then load at `fp16`, which that runtime still supports
+- Local ONNX models load on Intel Macs again: inference side runtimes pin `onnxruntime-node` 1.21.0, the last release whose prebuilt macOS x64 binary loads on macOS 12, instead of failing with `Cannot find module '../bin/napi-v6/darwin/x64/onnxruntime_binding.node'`; block-quantized exports (including the shipped `q4` tiny-title default) then load at `fp16`, which that runtime still supports
 - `pr://<n>`, `issue://<n>`, and repo-less `github` tool calls in a checkout whose `upstream` remote is not the fork parent of `origin` now resolve to `origin` instead of the upstream project; `gh repo set-default` still wins
 - `omp -p` text mode now prints each automatic retry with its error (for example "Couldn't reach api.anthropic.com … check your network") instead of showing only `Working...` while a turn retries ([#17529](https://github.com/can1357/oh-my-pi/pull/17529) by [@Mannan-Goyal](https://github.com/Mannan-Goyal))
 
