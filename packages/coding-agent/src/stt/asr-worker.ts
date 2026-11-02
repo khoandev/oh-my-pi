@@ -17,15 +17,15 @@ import packageJson from "../../package.json" with { type: "json" };
 import {
 	errorMessage,
 	errorText,
-	getTransformersVersionSpec,
 	loadTransformersRuntime,
 	MemoizedRuntime,
 	replayCachedReady,
 	sendLog,
 	sendProgress,
+	transformersRuntimeKey,
 } from "../subprocess/worker-runtime";
 import { resolveTinyModelDevicePreference, type TinyModelDevice, tinyModelDeviceLoadOrder } from "../tiny/device";
-import { resolveTinyModelDtypeOverride, type TinyModelDtype } from "../tiny/dtype";
+import { resolveLocalModelDtype, resolveTinyModelDtypeOverride, type TinyModelDtype } from "../tiny/dtype";
 import type { SttTransport, SttWorkerInbound } from "./asr-protocol";
 import { type EndpointerEvent, StreamEndpointer } from "./endpointer";
 import {
@@ -136,8 +136,7 @@ function getSherpaVersionSpec(): string {
 }
 
 function getSttRuntimeDir(): string {
-	const key = getTransformersVersionSpec().replace(/[^A-Za-z0-9._-]/g, "_");
-	return path.join(path.dirname(getTinyModelsCacheDir()), "stt-runtime", `transformers-${key}`);
+	return path.join(path.dirname(getTinyModelsCacheDir()), "stt-runtime", `transformers-${transformersRuntimeKey()}`);
 }
 
 function getSherpaRuntimeDir(): string {
@@ -184,7 +183,7 @@ async function loadPipelineOnDevice(
 ): Promise<AutomaticSpeechRecognitionPipeline> {
 	return transformers.pipeline(ASR_TASK, spec.repo, {
 		device,
-		dtype: sttModelDtypeOverride ?? spec.dtype,
+		dtype: resolveLocalModelDtype(sttModelDtypeOverride, spec.dtype),
 		progress_callback: info => sendProgress(transport, requestId, modelKey, info),
 	});
 }
@@ -254,7 +253,7 @@ async function loadTransformersModel(
 		engine: "transformers",
 		device,
 		requestedDevice: sttModelDevicePreference.device,
-		dtype: sttModelDtypeOverride ?? spec.dtype,
+		dtype: resolveLocalModelDtype(sttModelDtypeOverride, spec.dtype),
 		elapsedMs: Math.round(performance.now() - startedAt),
 	});
 	return { engine: "transformers", pipeline };

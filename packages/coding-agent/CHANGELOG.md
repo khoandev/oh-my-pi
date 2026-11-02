@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Local ONNX models load on Intel Macs again: inference side runtimes pin `onnxruntime-node` 1.21.0, the last release whose prebuilt macOS x64 binary loads on macOS 12, instead of failing with `Cannot find module '../bin/napi-v6/darwin/x64/onnxruntime_binding.node'`; the `q4` tiny-title exports then load at `fp16`, which that runtime still supports
 - `omp -p` text mode now prints each automatic retry with its error (for example "Couldn't reach api.anthropic.com … check your network") instead of showing only `Working...` while a turn retries ([#17529](https://github.com/can1357/oh-my-pi/pull/17529) by [@Mannan-Goyal](https://github.com/Mannan-Goyal))
 
 ## [18.15.0] - 2026-11-01

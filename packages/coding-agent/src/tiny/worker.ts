@@ -18,10 +18,10 @@ import {
 	errorMessage,
 	errorText,
 	formatOnnxRuntimeCudaDiagnostics,
-	getTransformersVersionSpec,
 	loadTransformersRuntime,
 	MemoizedRuntime,
 	sendProgress,
+	transformersRuntimeKey,
 	type TransformersRuntimeMetadata,
 } from "../subprocess/worker-runtime";
 import { renderTextChatTemplate } from "./completion-prompt";
@@ -31,7 +31,7 @@ import {
 	type TinyOnnxDevice,
 	tinyModelDeviceLoadOrder,
 } from "./device";
-import { resolveTinyModelDtypeOverride, type TinyModelDtype } from "./dtype";
+import { resolveLocalModelDtype, resolveTinyModelDtypeOverride, type TinyModelDtype } from "./dtype";
 import {
 	getTinyLocalModelSpec,
 	isTinyLocalModelKey,
@@ -81,7 +81,7 @@ function getTinyTitleRuntimeDir(): string {
 	return path.join(
 		path.dirname(getTinyModelsCacheDir()),
 		"tiny-title-runtime",
-		`transformers-${getTransformersVersionSpec().replace(/[^A-Za-z0-9._-]/g, "_")}`,
+		`transformers-${transformersRuntimeKey()}`,
 	);
 }
 
@@ -129,7 +129,7 @@ class OnnxModel {
 	#spec: TinyTitleLocalModelSpec;
 	#modelKey: TinyLocalModelKey;
 	#devicePreference: TinyModelDevicePreference;
-	#dtypeOverride: TinyModelDtype | undefined;
+	#dtype: TinyModelDtype;
 	#runtime = new MemoizedRuntime<TransformersRuntime>();
 	#pipeline: Promise<TextGenerationPipeline> | null = null;
 
@@ -142,7 +142,7 @@ class OnnxModel {
 		this.#modelKey = modelKey;
 		this.#spec = spec;
 		this.#devicePreference = devicePreference;
-		this.#dtypeOverride = dtypeOverride;
+		this.#dtype = resolveLocalModelDtype(dtypeOverride, spec.dtype);
 	}
 
 	#loadRuntime(reply: ReplyTransport, requestId: string): Promise<TransformersRuntime> {
@@ -168,7 +168,7 @@ class OnnxModel {
 			try {
 				const generator = await transformers.pipeline("text-generation", this.#spec.repo, {
 					device,
-					dtype: this.#dtypeOverride ?? this.#spec.dtype,
+					dtype: this.#dtype,
 					progress_callback: info => sendProgress(reply, requestId, this.#modelKey, info),
 				});
 				return { generator, device };
@@ -208,7 +208,7 @@ class OnnxModel {
 						repo: this.#spec.repo,
 						device,
 						requestedDevice: this.#devicePreference.device,
-						dtype: this.#dtypeOverride ?? this.#spec.dtype,
+						dtype: this.#dtype,
 						elapsedMs: Math.round(performance.now() - startedAt),
 					});
 					return generator;

@@ -7,6 +7,9 @@ import {
 	getTinyModelsCacheDir,
 	installRuntimeModuleResolver,
 	isCompiledBinary,
+	logger,
+	onnxRuntimeBindingPath,
+	onnxRuntimeInstallOverrides,
 	resolveRuntimeModule,
 } from "@oh-my-pi/pi-utils";
 import packageJson from "../../package.json" with { type: "json" };
@@ -294,6 +297,19 @@ export function getTransformersVersionSpec(): string {
 	return cachedTransformersVersionSpec;
 }
 
+/**
+ * Version tag of a Transformers side runtime: the package version plus the
+ * host's `onnxruntime-node` pin. Including the pin keeps a host that needs
+ * {@link onnxRuntimeInstallOverrides} (darwin/x64, where 1.24.0+ ships no
+ * prebuilt binding) from reusing a cache built around a release that cannot
+ * load.
+ */
+export function transformersRuntimeKey(): string {
+	const spec = getTransformersVersionSpec().replace(/[^A-Za-z0-9._-]/g, "_");
+	const pin = onnxRuntimeInstallOverrides()?.[ONNX_RUNTIME_NODE_PACKAGE];
+	return pin === undefined ? spec : `${spec}_ort-${pin.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+}
+
 // ── Transformers runtime loader ─────────────────────────────────────
 
 /** The subset of the Transformers.js module surface {@link configureTransformers} touches. */
@@ -410,6 +426,38 @@ export async function formatOnnxRuntimeCudaDiagnostics(
 	return lines.join("\n");
 }
 
+/**
+ * Entry of the ambient (source-install) Transformers runtime, or `null` when it
+ * cannot load and the side runtime must be installed instead.
+ *
+ * Transformers.js requires `onnxruntime-node` at module load, so the copy its
+ * dependency graph resolves has to carry a prebuilt binding for this host;
+ * onnxruntime-node 1.24.0 dropped the macOS x64 prebuilts, which turns the
+ * first require into `Cannot find module '../bin/napi-v6/darwin/x64/…'`.
+ */
+function ambientTransformersEntry(): string | null {
+	if (isCompiledBinary()) return null;
+	try {
+		const entry = sourceRequire.resolve(TRANSFORMERS_PACKAGE);
+		const ortManifest = createRequire(entry).resolve(`${ONNX_RUNTIME_NODE_PACKAGE}/package.json`);
+		if (onnxRuntimeBindingPath(path.dirname(ortManifest)) !== null) return entry;
+		logger.debug(
+			"transformers: ambient onnxruntime-node has no prebuilt binding for this host; installing a side runtime",
+			{
+				entry,
+				platform: process.platform,
+				arch: process.arch,
+				ortPackageDir: path.dirname(ortManifest),
+			},
+		);
+	} catch (error) {
+		logger.debug("transformers: ambient runtime is not loadable; installing a side runtime", {
+			error: errorMessage(error),
+		});
+	}
+	return null;
+}
+
 function configureTransformers<T extends ConfigurableTransformers>(transformers: T): T {
 	transformers.env.cacheDir = getTinyModelsCacheDir();
 	transformers.env.allowLocalModels = false;
@@ -450,16 +498,17 @@ export function loadTransformersRuntime<T extends ConfigurableTransformers, K>(
 	runtimeDir: () => string,
 ): Promise<T> {
 	return holder.load(async () => {
-		if (!isCompiledBinary()) {
-			const entry = sourceRequire.resolve(TRANSFORMERS_PACKAGE);
-			return attachTransformersRuntimeMetadata(configureTransformers(sourceRequire(entry) as T), {
-				__ompTransformersEntry: entry,
+		const ambientEntry = ambientTransformersEntry();
+		if (ambientEntry !== null) {
+			return attachTransformersRuntimeMetadata(configureTransformers(sourceRequire(ambientEntry) as T), {
+				__ompTransformersEntry: ambientEntry,
 			});
 		}
 		const installedDir = await ensureRuntimeInstalled({
 			runtimeDir: runtimeDir(),
 			install: {
 				dependencies: { [TRANSFORMERS_PACKAGE]: getTransformersVersionSpec() },
+				overrides: onnxRuntimeInstallOverrides(),
 				trustedDependencies: ["onnxruntime-node"],
 			},
 			probePackage: TRANSFORMERS_PACKAGE,

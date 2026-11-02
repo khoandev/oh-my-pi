@@ -1,5 +1,5 @@
 import type { DataType } from "@huggingface/transformers";
-import { $env } from "@oh-my-pi/pi-utils";
+import { $env, onnxRuntimeSupportsBlockQuantization } from "@oh-my-pi/pi-utils";
 
 /** ONNX quantization / precision for local tiny models (transformers.js `dtype`). */
 export type TinyModelDtype = DataType;
@@ -44,6 +44,43 @@ export function resolveTinyModelDtypeOverride(
 	value: string | undefined = $env.PI_TINY_DTYPE,
 ): TinyModelDtype | undefined {
 	return normalizeTinyModelDtype(value);
+}
+
+/**
+ * dtypes whose weights are 1–4 bit block-quantized (`GatherBlockQuantized`),
+ * loadable only from onnxruntime-node 1.23.
+ */
+const BLOCK_QUANTIZED_DTYPES: Partial<Record<TinyModelDtype, true>> = {
+	q4: true,
+	q4f16: true,
+	bnb4: true,
+	q2: true,
+	q2f16: true,
+	q1: true,
+	q1f16: true,
+};
+
+/** Precision every shipped local model also publishes, used when the requested one cannot load. */
+const HOST_FALLBACK_DTYPE: TinyModelDtype = "fp16";
+
+/**
+ * The dtype a local model actually loads with: the explicit override when set,
+ * else the model's shipped dtype, narrowed to what this host's ONNX Runtime can
+ * load.
+ *
+ * Intel Macs pin onnxruntime-node 1.21.0 — the last release whose prebuilt macOS
+ * x64 binary loads on macOS 12 — which predates block-quantized weights, so the
+ * shipped `q4` export fails at load with `Unrecognized attribute: bits`. Those
+ * hosts load `fp16` instead, which every shipped model publishes.
+ */
+export function resolveLocalModelDtype(
+	override: TinyModelDtype | undefined,
+	specDtype: TinyModelDtype,
+	supportsBlockQuantization = onnxRuntimeSupportsBlockQuantization(),
+): TinyModelDtype {
+	const dtype = override ?? specDtype;
+	if (supportsBlockQuantization || !BLOCK_QUANTIZED_DTYPES[dtype]) return dtype;
+	return HOST_FALLBACK_DTYPE;
 }
 
 /** Sentinel `providers.tinyModelDtype` value meaning "use each model's shipped dtype". */

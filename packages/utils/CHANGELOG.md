@@ -8,6 +8,7 @@
 ### Added
 
 - Added `isPidAlive` (signal-0 liveness probe) and `asStrictBytes` (a `Uint8Array` narrowed to its own `ArrayBuffer` for WebCrypto)
+- Added `onnxRuntimeInstallOverrides`, `onnxRuntimeBindingPath`, and `onnxRuntimeSupportsBlockQuantization` for hosts whose `onnxruntime-node` release ships no prebuilt for the platform (macOS x64 since 1.24.0)
 
 ## [18.15.0] - 2026-11-01
 

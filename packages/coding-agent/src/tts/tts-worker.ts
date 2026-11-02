@@ -12,7 +12,7 @@ import {
 	TRANSFORMERS_PACKAGE,
 } from "../subprocess/worker-runtime";
 import { resolveTinyModelDevicePreference, type TinyModelDevice, tinyModelDeviceLoadOrder } from "../tiny/device";
-import { resolveTinyModelDtypeOverride, type TinyModelDtype } from "../tiny/dtype";
+import { resolveLocalModelDtype, resolveTinyModelDtypeOverride, type TinyModelDtype } from "../tiny/dtype";
 import {
 	getTtsLocalModelSpec,
 	resolveTtsSpeed,
@@ -25,7 +25,7 @@ import {
 	KOKORO_PACKAGE,
 	KOKORO_VERSION,
 	ONNXRUNTIME_NODE_PACKAGE,
-	ONNXRUNTIME_NODE_VERSION,
+	ttsOnnxRuntimeVersion,
 } from "./runtime";
 import type { TtsTransport, TtsWorkerInbound } from "./tts-protocol";
 
@@ -143,7 +143,7 @@ function loadKokoroRuntime(
 			runtimeDir: getTtsRuntimeDir(),
 			install: {
 				dependencies: { [KOKORO_PACKAGE]: KOKORO_VERSION },
-				overrides: { [ONNXRUNTIME_NODE_PACKAGE]: ONNXRUNTIME_NODE_VERSION },
+				overrides: { [ONNXRUNTIME_NODE_PACKAGE]: ttsOnnxRuntimeVersion() },
 				trustedDependencies: [ONNXRUNTIME_NODE_PACKAGE],
 			},
 			probePackage: KOKORO_PACKAGE,
@@ -175,7 +175,7 @@ async function loadModelOnDevice(
 ): Promise<KokoroTtsInstance> {
 	return runtime.KokoroTTS.from_pretrained(spec.repo, {
 		device,
-		dtype: ttsDtypeOverride ?? spec.dtype,
+		dtype: resolveLocalModelDtype(ttsDtypeOverride, spec.dtype),
 		progress_callback: info => sendProgress(transport, requestId, modelKey, info),
 	});
 }
@@ -239,7 +239,7 @@ async function loadModel(
 				repo: spec.repo,
 				device,
 				requestedDevice: ttsDevicePreference.device,
-				dtype: ttsDtypeOverride ?? spec.dtype,
+				dtype: resolveLocalModelDtype(ttsDtypeOverride, spec.dtype),
 				elapsedMs: Math.round(performance.now() - startedAt),
 			});
 			transport.send({

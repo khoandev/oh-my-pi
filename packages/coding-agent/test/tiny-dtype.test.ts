@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	normalizeTinyModelDtype,
+	resolveLocalModelDtype,
 	resolveTinyModelDtypeOverride,
 	TINY_MODEL_DTYPE_DEFAULT,
 	TINY_MODEL_DTYPE_SETTING_VALUES,
@@ -22,6 +23,23 @@ describe("tiny model dtype selection", () => {
 
 	it("rejects an unsupported precision", () => {
 		expect(() => resolveTinyModelDtypeOverride("int4")).toThrow("Unsupported PI_TINY_DTYPE");
+	});
+});
+
+describe("host dtype narrowing", () => {
+	it("keeps the requested dtype where the runtime loads block-quantized weights", () => {
+		expect(resolveLocalModelDtype(undefined, "q4", true)).toBe("q4");
+		expect(resolveLocalModelDtype("q4", "q8", true)).toBe("q4");
+	});
+
+	it("replaces a block-quantized dtype where the runtime cannot load it", () => {
+		expect(resolveLocalModelDtype(undefined, "q4", false)).toBe("fp16");
+		expect(resolveLocalModelDtype("bnb4", "q4", false)).toBe("fp16");
+	});
+
+	it("leaves dtypes the older runtime still loads untouched", () => {
+		expect(resolveLocalModelDtype(undefined, "q8", false)).toBe("q8");
+		expect(resolveLocalModelDtype("fp32", "q4", false)).toBe("fp32");
 	});
 });
 
