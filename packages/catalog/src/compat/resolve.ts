@@ -905,6 +905,7 @@ function resolveAnthropicPolicy(
 		signingEndpoint,
 		supportsContextManagement: true,
 		supportsServerCompaction: false,
+		supportsMessageThreads: false,
 		firstPartyProvider: false,
 		honorsClaudeCodeBetaKillSwitch: false,
 		supportsOutputEffort: true,
