@@ -1,9 +1,11 @@
-import { formatBytes } from "@oh-my-pi/pi-utils";
+import { formatBytes, onnxRuntimeSupportsBlockQuantization } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { resolveTinyModelDtypeOverride } from "../tiny/dtype";
 import {
 	DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY,
 	getTinyLocalModelSpec,
 	isTinyLocalModelKey,
+	planTinyTextOnnxLoad,
 	TINY_LOCAL_MODELS,
 	type TinyLocalModelKey,
 } from "../tiny/models";
@@ -69,14 +71,20 @@ function downloadErrorSummary(error: string | undefined): string | undefined {
 	return [first, ...details].join("\n");
 }
 
-export function resolveModels(model: string | undefined, mlx = tinyWorkerUsesMlx()): TinyLocalModelKey[] {
+export function resolveModels(
+	model: string | undefined,
+	mlx = tinyWorkerUsesMlx(),
+	supportsBlockQuantization = onnxRuntimeSupportsBlockQuantization(),
+): TinyLocalModelKey[] {
 	if (!model) return [DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY];
 	// `all` is a prefetch convenience: skip models the active backend refuses before
 	// load, so the bulk download stays green when every *usable* model succeeds.
-	if (model === "all")
+	if (model === "all") {
+		const dtypeOverride = resolveTinyModelDtypeOverride();
 		return TINY_LOCAL_MODELS.filter(
-			spec => mlx || !("onnxUnsupportedReason" in spec) || !spec.onnxUnsupportedReason,
+			spec => mlx || !planTinyTextOnnxLoad(spec, dtypeOverride, supportsBlockQuantization).unsupportedReason,
 		).map(spec => spec.key);
+	}
 	if (!isTinyLocalModelKey(model)) {
 		const values = TINY_LOCAL_MODELS.map(spec => spec.key).join(", ");
 		throw new Error(`Unknown tiny local model: ${model}. Expected one of: ${values}, ${SMOLLM_KEY}, all`);
@@ -93,8 +101,13 @@ async function listModels(json: boolean | undefined): Promise<void> {
 		dir: getSmolLmModelDir(),
 		ready: await smolLmWeightsReady(),
 	};
+	const dtypeOverride = resolveTinyModelDtypeOverride();
 	if (json) {
-		writeLine(JSON.stringify({ models: TINY_LOCAL_MODELS, wordCompletion }));
+		const models = TINY_LOCAL_MODELS.map(spec => ({
+			...spec,
+			unavailableReason: planTinyTextOnnxLoad(spec, dtypeOverride).unsupportedReason,
+		}));
+		writeLine(JSON.stringify({ models, wordCompletion }));
 		return;
 	}
 	writeLine(chalk.bold("Tiny local models"));
@@ -102,6 +115,8 @@ async function listModels(json: boolean | undefined): Promise<void> {
 		const defaultMark = spec.key === DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY ? chalk.cyan(" default") : "";
 		writeLine(`${chalk.cyan(spec.key)}${defaultMark}`);
 		writeLine(`  ${spec.label} — ${spec.description}`);
+		const unavailable = planTinyTextOnnxLoad(spec, dtypeOverride).unsupportedReason;
+		if (unavailable) writeLine(`  ${chalk.yellow(`unavailable: ${unavailable}`)}`);
 	}
 	const status = wordCompletion.ready ? chalk.green("downloaded") : chalk.dim("not downloaded");
 	writeLine(`${chalk.cyan(SMOLLM_KEY)}`);

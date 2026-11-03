@@ -27,6 +27,7 @@
 
 ### Fixed
 
+- Intel Macs no longer download hundreds of megabytes of local tiny-text weights that cannot load: the runtime pinned there (`onnxruntime-node` 1.21.0) runs neither the `q4`/`q8` exports (`GatherBlockQuantized`) nor the `fp16` one (`GroupQueryAttention`), so those models now report unavailability before any download and `omp tiny-models list` shows the reason; `PI_TINY_DTYPE=fp32` loads the fp32 export instead
 - Local ONNX models load on Intel Macs again: inference side runtimes pin `onnxruntime-node` 1.21.0, the last release whose prebuilt macOS x64 binary loads on macOS 12, instead of failing with `Cannot find module '../bin/napi-v6/darwin/x64/onnxruntime_binding.node'`; block-quantized exports (including the shipped `q4` tiny-title default) then load at `fp16`, which that runtime still supports
 - Browser: `browser.close({ all: true })` from a subagent no longer closes its parent's tabs; it releases only the calling agent's tabs. Tabs now belong to the agent that opened them rather than its conversation id, so after `/new`, `/resume`, fork, or branch they are still frozen, idle-closed, released by close-all, and closed when the session ends instead of leaking ([#15975](https://github.com/can1357/oh-my-pi/issues/15975), [#16133](https://github.com/can1357/oh-my-pi/pull/16133) by [@harshaygadekar](https://github.com/harshaygadekar))
 - `lsp request` now sends `payload: "null"` as JSON null instead of substituting auto-built document params ([#17715](https://github.com/can1357/oh-my-pi/issues/17715)).

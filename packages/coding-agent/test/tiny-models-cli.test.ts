@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { resolveModels, runTinyModelsCommand } from "@oh-my-pi/pi-coding-agent/cli/tiny-models-cli";
-import { TINY_LOCAL_MODELS } from "@oh-my-pi/pi-coding-agent/tiny/models";
+import { planTinyTextOnnxLoad, TINY_LOCAL_MODELS } from "@oh-my-pi/pi-coding-agent/tiny/models";
 import { tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 
 afterEach(() => {
@@ -8,20 +8,21 @@ afterEach(() => {
 });
 
 describe("tiny-models download model resolution", () => {
-	it("excludes ONNX-blocked models from `all` so the bulk prefetch stays green", () => {
-		const unsupported = TINY_LOCAL_MODELS.filter(
-			spec => "onnxUnsupportedReason" in spec && spec.onnxUnsupportedReason,
-		).map(spec => spec.key);
-		// Guard: keep this regression meaningful — at least one registry entry must be load-blocked.
-		expect(unsupported.length).toBeGreaterThan(0);
-
-		const all = resolveModels("all", false);
-		for (const key of unsupported) expect(all).not.toContain(key);
-
+	it("excludes models the ONNX backend cannot load from `all` so the bulk prefetch stays green", () => {
 		const usable = TINY_LOCAL_MODELS.filter(
-			spec => !("onnxUnsupportedReason" in spec) || !spec.onnxUnsupportedReason,
+			spec => !planTinyTextOnnxLoad(spec, undefined, true).unsupportedReason,
 		).map(spec => spec.key);
-		for (const key of usable) expect(all).toContain(key);
+		// Guard: keep this regression meaningful — a load-blocked entry must exist.
+		expect(usable.length).toBeGreaterThan(0);
+		expect(usable.length).toBeLessThan(TINY_LOCAL_MODELS.length);
+
+		expect(resolveModels("all", false, true)).toEqual(usable);
+	});
+
+	it("drops every text model from `all` where the runtime loads only float32 weights", () => {
+		// The darwin/x64 pin cannot run any published q4/q8/fp16 export, so a bulk
+		// prefetch there would download weights that always fail at load.
+		expect(resolveModels("all", false, false)).toEqual([]);
 	});
 
 	it("includes ONNX-blocked models in `all` when the MLX backend is active", () => {

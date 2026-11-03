@@ -31,10 +31,11 @@ import {
 	type TinyOnnxDevice,
 	tinyModelDeviceLoadOrder,
 } from "./device";
-import { resolveLocalModelDtype, resolveTinyModelDtypeOverride, type TinyModelDtype } from "./dtype";
+import { resolveTinyModelDtypeOverride, type TinyModelDtype } from "./dtype";
 import {
 	getTinyLocalModelSpec,
 	isTinyLocalModelKey,
+	planTinyTextOnnxLoad,
 	type TinyLocalModelKey,
 	type TinyTitleLocalModelSpec,
 } from "./models";
@@ -130,6 +131,8 @@ class OnnxModel {
 	#modelKey: TinyLocalModelKey;
 	#devicePreference: TinyModelDevicePreference;
 	#dtype: TinyModelDtype;
+	/** Set when this host cannot load any export the model publishes (checked before any download). */
+	#unsupportedReason: string | undefined;
 	#runtime = new MemoizedRuntime<TransformersRuntime>();
 	#pipeline: Promise<TextGenerationPipeline> | null = null;
 
@@ -142,7 +145,9 @@ class OnnxModel {
 		this.#modelKey = modelKey;
 		this.#spec = spec;
 		this.#devicePreference = devicePreference;
-		this.#dtype = resolveLocalModelDtype(dtypeOverride, spec.dtype);
+		const plan = planTinyTextOnnxLoad(spec, dtypeOverride);
+		this.#dtype = plan.dtype;
+		this.#unsupportedReason = plan.unsupportedReason;
 	}
 
 	#loadRuntime(reply: ReplyTransport, requestId: string): Promise<TransformersRuntime> {
@@ -195,8 +200,8 @@ class OnnxModel {
 	/** Resident pipeline, loading (with progress for `requestId`) on first use. */
 	pipeline(reply: ReplyTransport, requestId: string): Promise<TextGenerationPipeline> {
 		if (this.#pipeline) return this.#pipeline;
-		if (this.#spec.onnxUnsupportedReason) {
-			return Promise.reject(new Error(`${this.#modelKey} is unavailable: ${this.#spec.onnxUnsupportedReason}`));
+		if (this.#unsupportedReason) {
+			return Promise.reject(new Error(`${this.#modelKey} is unavailable: ${this.#unsupportedReason}`));
 		}
 		const startedAt = performance.now();
 		const loaded = this.#loadRuntime(reply, requestId)

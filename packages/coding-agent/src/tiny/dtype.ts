@@ -60,7 +60,7 @@ const BLOCK_QUANTIZED_DTYPES: Partial<Record<TinyModelDtype, true>> = {
 	q1f16: true,
 };
 
-/** Precision every shipped local model also publishes, used when the requested one cannot load. */
+/** Precision every shipped speech model also publishes, used when the requested one cannot load. */
 const HOST_FALLBACK_DTYPE: TinyModelDtype = "fp16";
 
 /**
@@ -69,9 +69,15 @@ const HOST_FALLBACK_DTYPE: TinyModelDtype = "fp16";
  * load.
  *
  * Intel Macs pin onnxruntime-node 1.21.0 — the last release whose prebuilt macOS
- * x64 binary loads on macOS 12 — which predates block-quantized weights, so the
+ * x64 binary loads on macOS 12 — which predates block-quantized weights, so a
  * shipped `q4` export fails at load with `Unrecognized attribute: bits`. Those
- * hosts load `fp16` instead, which every shipped model publishes.
+ * hosts narrow to `fp16` instead.
+ *
+ * `fp16` is not a universal escape hatch: an export whose attention uses
+ * `GroupQueryAttention` gets float16 operands there, which the pinned runtime's
+ * CPU provider rejects. Text models therefore plan their load with
+ * `planTinyTextOnnxLoad` (`tiny/models.ts`), which reports such hosts as
+ * unsupported instead of downloading weights that cannot load.
  */
 export function resolveLocalModelDtype(
 	override: TinyModelDtype | undefined,

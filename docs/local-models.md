@@ -36,9 +36,14 @@ The tiny-model CLI and source registry retain **title** and **memory** groupings
   '../bin/napi-v6/darwin/x64/onnxruntime_binding.node'`, and 1.22.0/1.23.0 need a libc++
   symbol macOS 12 does not have (`Symbol not found: __ZNSt3__18to_charsEPcS0_d`). Omp pins
   1.21.0 on those hosts for every inference side runtime, which loads on macOS 12 and runs
-  embeddings, Whisper dictation, and Kokoro speech; because 1.21 predates block-quantized
-  weights, the `q4` tiny-title exports load at `fp16` instead (larger download, slower than
-  `q4`, same output contract).
+  embeddings, Whisper dictation, and Kokoro speech. Local tiny **text** models do not run
+  there: their `q4`/`q8` exports gather embeddings through `GatherBlockQuantized` (added in
+  onnxruntime 1.23, so 1.21 fails with `Unrecognized attribute: bits`), and their `fp16`
+  export feeds float16 tensors to `GroupQueryAttention`, which 1.21's CPU provider
+  implements for float32 only (`This is an invalid model`). The worker therefore refuses
+  these models before downloading a byte, and `omp tiny-models list` marks each entry
+  unavailable; `PI_TINY_DTYPE=fp32` loads the unturned export instead, at a
+  multi-hundred-MB download cost.
 - **Non-FHS distros (NixOS, and any host without `libstdc++.so.6` on the loader path)**: the
   on-demand `onnxruntime-node` / `sherpa-onnx-node` / `sharp` addons are prebuilt binaries that
   `dlopen` `libstdc++.so.6` and `libgcc_s.so.1`, and they carry their own `DT_RUNPATH`, so nothing in
@@ -97,8 +102,9 @@ The tiny-model CLI and source registry retain **title** and **memory** groupings
   `fp32`, `fp16`, `q8`, `int8`, `uint8`, `q4`, `bnb4`, `q4f16`, `q2`, `q2f16`, `q1`, `q1f16`; an
   unrecognized value fails loudly at worker startup. The requested precision is narrowed to what the
   host's ONNX Runtime can load: on Intel Macs (pinned to onnxruntime-node 1.21.0, see *Runtime*)
-  block-quantized `q4`/`q4f16`/`q8`/`bnb4`/`q2`/`q1` exports load at `fp16`, which the shipped
-  models also publish.
+  block-quantized `q4`/`q4f16`/`q8`/`bnb4`/`q2`/`q1` exports load at `fp16` for the speech models.
+  Tiny text models are unavailable there unless `PI_TINY_DTYPE=fp32` is set, because their `fp16`
+  export cannot run on that runtime either.
 - **Load-time correction (important).** An earlier belief that "q4 >=1B models take minutes to load"
   was a **measurement artifact** caused by running ~5 multi-GB HuggingFace downloads in parallel
   (I/O saturation). Clean, isolated **warm** loads are all sub-3s:
