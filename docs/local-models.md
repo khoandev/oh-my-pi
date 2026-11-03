@@ -39,11 +39,11 @@ The tiny-model CLI and source registry retain **title** and **memory** groupings
   embeddings, Whisper dictation, and Kokoro speech. Local tiny **text** models do not run
   there: their `q4`/`q8` exports gather embeddings through `GatherBlockQuantized` (added in
   onnxruntime 1.23, so 1.21 fails with `Unrecognized attribute: bits`), and their `fp16`
-  export feeds float16 tensors to `GroupQueryAttention`, which 1.21's CPU provider
-  implements for float32 only (`This is an invalid model`). The worker therefore refuses
-  these models before downloading a byte, and `omp tiny-models list` marks each entry
-  unavailable; `PI_TINY_DTYPE=fp32` loads the unturned export instead, at a
-  multi-hundred-MB download cost.
+  and `fp32` exports both fail on the `GroupQueryAttention` node that provider rejects
+  (`This is an invalid model`) — no `PI_TINY_DTYPE` value rescues them, and the failed
+  load aborts the worker process outright. The worker therefore reports these models as
+  unavailable before downloading a byte (`omp tiny-models list` shows it per entry); on
+  this hardware titles, memory extraction, and other tiny-text roles stay on online models.
 - **Non-FHS distros (NixOS, and any host without `libstdc++.so.6` on the loader path)**: the
   on-demand `onnxruntime-node` / `sherpa-onnx-node` / `sharp` addons are prebuilt binaries that
   `dlopen` `libstdc++.so.6` and `libgcc_s.so.1`, and they carry their own `DT_RUNPATH`, so nothing in
@@ -103,8 +103,7 @@ The tiny-model CLI and source registry retain **title** and **memory** groupings
   unrecognized value fails loudly at worker startup. The requested precision is narrowed to what the
   host's ONNX Runtime can load: on Intel Macs (pinned to onnxruntime-node 1.21.0, see *Runtime*)
   block-quantized `q4`/`q4f16`/`q8`/`bnb4`/`q2`/`q1` exports load at `fp16` for the speech models.
-  Tiny text models are unavailable there unless `PI_TINY_DTYPE=fp32` is set, because their `fp16`
-  export cannot run on that runtime either.
+  Tiny text models are unavailable there at every dtype (see *Runtime*).
 - **Load-time correction (important).** An earlier belief that "q4 >=1B models take minutes to load"
   was a **measurement artifact** caused by running ~5 multi-GB HuggingFace downloads in parallel
   (I/O saturation). Clean, isolated **warm** loads are all sub-3s:

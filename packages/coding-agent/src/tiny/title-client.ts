@@ -35,7 +35,7 @@ import { tinyModelDtypeSettingToEnv } from "./dtype";
 import { formatTitleUserMessage } from "./message-preproc";
 import { ensureTinyMlxRuntime, getTinyMlxModelDir, MLX_LM_VERSION } from "./mlx-runtime";
 import MLX_SERVER_SCRIPT from "./mlx-server.py" with { type: "text" };
-import { getTinyLocalModelSpec, isTinyLocalModelKey, type TinyLocalModelKey } from "./models";
+import { getTinyLocalModelSpec, isTinyLocalModelKey, planTinyTextOnnxLoad, type TinyLocalModelKey } from "./models";
 import { normalizeGeneratedTitle } from "./text";
 import {
 	TINY_WORKER_ARG,
@@ -337,6 +337,10 @@ export class TinyTitleClient {
 	 */
 	prewarm(modelKey: string): void {
 		if (!isTinyLocalModelKey(modelKey) || this.#hasFailed(modelKey)) return;
+		// No worker can serve a model this host cannot load, and spawning one only
+		// earns an error row plus a warning in every fresh session.
+		const spec = getTinyLocalModelSpec(modelKey);
+		if (!tinyWorkerUsesMlx() && spec && planTinyTextOnnxLoad(spec, undefined).unsupportedReason) return;
 		try {
 			this.#ensureWorker(modelKey).handle.send({ type: "ping", id: String(++this.#nextRequestId) });
 		} catch (error) {

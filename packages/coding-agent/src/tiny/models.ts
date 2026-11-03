@@ -165,19 +165,23 @@ export const TINY_LOCAL_MODELS = [
 
 /**
  * Why a host pinned to onnxruntime-node 1.21.0 cannot run any weight encoding
- * the shipped tiny-text repos publish.
+ * the shipped tiny-text repos publish. Verified on macOS 12 / darwin-x64
+ * against Falcon-H1-Tiny-90M with the runtime omp installs there:
  *
- * Those hosts (darwin/x64, see `onnxRuntimeInstallOverrides`) predate
- * block-quantized weights, so the `q4`/`q8` graphs fail at load on
- * `GatherBlockQuantized` (`Unrecognized attribute: bits`). Their `fp16` graphs
- * do not work either: the attention subgraph feeds `GroupQueryAttention`
- * float16 operands, and 1.21's CPU provider implements that kernel for float32
- * only ("This is an invalid model"). Only the unturned `fp32` export loads.
+ * - `q4`/`q8` fail on `GatherBlockQuantized` (`Unrecognized attribute: bits`):
+ *   1.21 predates block-quantized weights (onnxruntime 1.23+).
+ * - `fp16` and `fp32` fail on the same `GroupQueryAttention` node
+ *   ("This is an invalid model") - 1.21's CPU provider rejects this graph at
+ *   every dtype, so downcasting is not an escape hatch.
+ *
+ * Loading one is worse than useless: onnxruntime raises through N-API and Bun
+ * turns the unhandled C++ exception into a process abort, taking the worker
+ * with it. Hence the refusal happens before any download or runtime load.
  */
 export const LEGACY_ONNX_TEXT_REASON =
-	"the pinned onnxruntime-node 1.21.0 loads float32 weights only: the q4/q8 exports need GatherBlockQuantized (onnxruntime 1.23+) " +
-	"and the fp16 export feeds float16 tensors to GroupQueryAttention, which its CPU kernel rejects. Set PI_TINY_DTYPE=fp32 to " +
-	"load the fp32 export (a multi-hundred-MB download), or use an online model for this role.";
+	"the pinned onnxruntime-node 1.21.0 cannot run this export on darwin/x64: the q4/q8 graphs need GatherBlockQuantized " +
+	"(onnxruntime 1.23+), and every other dtype fails on the GroupQueryAttention node its CPU provider rejects; " +
+	"use an online model for this role";
 
 /** How a local text model loads on this host: the dtype, plus why it cannot load at all. */
 export interface TinyTextOnnxPlan {
@@ -189,8 +193,9 @@ export interface TinyTextOnnxPlan {
 /**
  * Resolve the ONNX load parameters for a local text model. A spec-level
  * `onnxUnsupportedReason` (an export the runtime refuses whatever the host)
- * wins over the host-level limit; an explicit `PI_TINY_DTYPE=fp32` override is
- * the documented escape hatch on hosts limited to float32.
+ * wins over the host-level limit; on a host whose runtime predates
+ * block-quantized weights every export this family ships is unloadable, so no
+ * dtype override rescues it either.
  */
 export function planTinyTextOnnxLoad(
 	spec: Pick<TinyTitleLocalModelSpec, "dtype" | "onnxUnsupportedReason">,
@@ -199,6 +204,6 @@ export function planTinyTextOnnxLoad(
 ): TinyTextOnnxPlan {
 	const dtype = resolveLocalModelDtype(override, spec.dtype, supportsBlockQuantization);
 	if (spec.onnxUnsupportedReason) return { dtype, unsupportedReason: spec.onnxUnsupportedReason };
-	if (supportsBlockQuantization || dtype === "fp32") return { dtype };
+	if (supportsBlockQuantization) return { dtype };
 	return { dtype, unsupportedReason: LEGACY_ONNX_TEXT_REASON };
 }

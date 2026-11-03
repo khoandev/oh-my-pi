@@ -59,12 +59,15 @@ describe("tiny text ONNX load planning", () => {
 	it("reports the host as unsupported instead of downloading weights that cannot load", () => {
 		const plan = planTinyTextOnnxLoad(spec, undefined, false);
 		expect(plan.unsupportedReason).toBe(LEGACY_ONNX_TEXT_REASON);
-		// The reason must name the escape hatch, or the failure is a dead end.
-		expect(plan.unsupportedReason).toContain("PI_TINY_DTYPE=fp32");
+		// The reason must name both blockers; a vaguer message sends users to retry.
+		expect(plan.unsupportedReason).toContain("GatherBlockQuantized");
+		expect(plan.unsupportedReason).toContain("GroupQueryAttention");
 	});
 
-	it("honours an explicit float32 override on that host", () => {
-		expect(planTinyTextOnnxLoad(spec, "fp32", false)).toEqual({ dtype: "fp32" });
+	it("refuses an explicit dtype override too: downcasting does not rescue that host", () => {
+		// Verified against the pinned runtime: the fp32 graph fails on the same
+		// GroupQueryAttention node, and the abort takes the worker process down.
+		expect(planTinyTextOnnxLoad(spec, "fp32", false).unsupportedReason).toBe(LEGACY_ONNX_TEXT_REASON);
 	});
 
 	it("keeps a per-model refusal on every host", () => {
