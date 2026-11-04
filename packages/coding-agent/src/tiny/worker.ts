@@ -7,13 +7,13 @@
  * NAPI finalizer never runs in a shared address space.
  */
 import * as path from "node:path";
+import { getTinyModelsCacheDir, logger, setProcessName } from "@oh-my-pi/pi-utils";
 import type {
 	ProgressInfo,
 	TextGenerationPipeline,
 	TextGenerationStringOutput,
 	StoppingCriteria as TransformersStoppingCriteria,
-} from "@huggingface/transformers";
-import { getTinyModelsCacheDir, logger, setProcessName } from "@oh-my-pi/pi-utils";
+} from "../subprocess/transformers-types";
 import {
 	errorMessage,
 	errorText,
@@ -21,7 +21,7 @@ import {
 	loadTransformersRuntime,
 	MemoizedRuntime,
 	sendProgress,
-	transformersRuntimeKey,
+	TRANSFORMERS_VERSION,
 	type TransformersRuntimeMetadata,
 } from "../subprocess/worker-runtime";
 import { renderTextChatTemplate } from "./completion-prompt";
@@ -82,7 +82,7 @@ function getTinyTitleRuntimeDir(): string {
 	return path.join(
 		path.dirname(getTinyModelsCacheDir()),
 		"tiny-title-runtime",
-		`transformers-${transformersRuntimeKey()}`,
+		`transformers-${TRANSFORMERS_VERSION.replace(/[^A-Za-z0-9._-]/g, "_")}`,
 	);
 }
 
