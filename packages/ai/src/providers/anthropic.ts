@@ -12,6 +12,7 @@ import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
+import { OPENCODE_PUBLIC_KEY, requiresOpenCodeEnvironment } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	$flag,
@@ -3998,7 +3999,7 @@ export function buildAnthropicSystemBlocks(
 export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): AnthropicClientOptionsResult {
 	const {
 		model,
-		apiKey,
+		apiKey: configuredApiKey,
 		extraBetas = [],
 		stream = true,
 		interleavedThinking = true,
@@ -4016,6 +4017,11 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		copilotCacheKey,
 		copilotCacheSnapshot,
 	} = args;
+	// OpenCode's free tier takes the literal `public` as its credential and
+	// reads it after the client-identity gate; an empty `X-Api-Key` is a shape
+	// it does not accept. A configured key is never replaced, so OAuth and
+	// account keys on the paid lanes of the same provider keep working.
+	const apiKey = configuredApiKey || (requiresOpenCodeEnvironment(model) ? OPENCODE_PUBLIC_KEY : "");
 	const compat = model.compat;
 	const disableStrictTools = disableStrictToolsOverride ?? compat.disableStrictTools;
 	const baseUrl = resolveAnthropicBaseUrl(model, apiKey);
@@ -4091,7 +4097,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			providerType: model.providerType,
 			protocol: "anthropic",
 			sessionId,
-			requiresOpenCodeClient: model.compat.requiresOpenCodeEnvironment,
+			requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 		});
 
 		return {
@@ -4165,7 +4171,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		providerType: model.providerType,
 		protocol: "anthropic",
 		sessionId,
-		requiresOpenCodeClient: model.compat.requiresOpenCodeEnvironment,
+		requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 	});
 
 	if (model.provider === "cloudflare-ai-gateway") {
@@ -5207,7 +5213,7 @@ function buildParams(
 		firstUserMessageText,
 		cacheControl,
 		dropCacheControl,
-		requiresOpenCodeEnvironment: model.compat.requiresOpenCodeEnvironment,
+		requiresOpenCodeEnvironment: requiresOpenCodeEnvironment(model),
 		cwd: options?.cwd,
 	});
 

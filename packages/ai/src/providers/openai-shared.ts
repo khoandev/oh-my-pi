@@ -22,6 +22,7 @@ import {
 	removeBlankCoreWeaveProjectHeaders,
 } from "@oh-my-pi/pi-catalog/wire/coreweave";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
+import { OPENCODE_PUBLIC_KEY, requiresOpenCodeEnvironment } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	classifyJsonPrefix,
@@ -167,9 +168,7 @@ export interface OpenAIStrictToolsState {
 export interface OpenAIRequestSetupModel extends OpenAIModelIdentity, CatalogPolicyInputs {
 	headers?: Record<string, string>;
 	premiumMultiplier?: number;
-	compat?: Pick<ResolvedOpenAISharedCompat, "promptCacheSessionHeader" | "sessionHeader"> & {
-		requiresOpenCodeEnvironment?: boolean;
-	};
+	compat?: Pick<ResolvedOpenAISharedCompat, "promptCacheSessionHeader" | "sessionHeader">;
 	cost?: { input?: number; output?: number };
 }
 
@@ -252,7 +251,7 @@ export function resolveOpenAIRequestSetup(
 	const isFreeModel = !model.cost?.input || model.cost.input === 0;
 	if (!apiKey) {
 		if (isOpenCode && isFreeModel) {
-			apiKey = "public";
+			apiKey = OPENCODE_PUBLIC_KEY;
 		} else if (!$env.OPENAI_API_KEY) {
 			throw new AIError.MissingApiKeyError(
 				isOpenCode ? model.provider : undefined,
@@ -263,7 +262,7 @@ export function resolveOpenAIRequestSetup(
 		} else {
 			apiKey = $env.OPENAI_API_KEY;
 		}
-	} else if (isOpenCode && !isFreeModel && apiKey === "public") {
+	} else if (isOpenCode && !isFreeModel && apiKey === OPENCODE_PUBLIC_KEY) {
 		throw new AIError.MissingApiKeyError(
 			model.provider,
 			`${model.provider} API key is required for paid model ${model.id}`,
@@ -373,7 +372,7 @@ export function resolveOpenAIRequestSetup(
 		protocol: "openai",
 		sessionId,
 		cacheAffinity: resolveOpenCodeGoCacheAffinity(model, options.promptCacheAffinityKey),
-		requiresOpenCodeClient: model.compat?.requiresOpenCodeEnvironment,
+		requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 	});
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);
@@ -395,7 +394,7 @@ export function resolveOpenAIRequestSetup(
 	// guards in google-vertex / amazon-bedrock and send no Authorization here
 	// (#6188). A caller-supplied Authorization in `model.headers` still wins.
 	if (apiKey !== NO_AUTH_SENTINEL) {
-		const effectiveApiKey = (!apiKey || apiKey === "") && isOpenCode && isFreeModel ? "public" : apiKey;
+		const effectiveApiKey = (!apiKey || apiKey === "") && isOpenCode && isFreeModel ? OPENCODE_PUBLIC_KEY : apiKey;
 		if (effectiveApiKey) {
 			headers.Authorization ??= `Bearer ${effectiveApiKey}`;
 		}

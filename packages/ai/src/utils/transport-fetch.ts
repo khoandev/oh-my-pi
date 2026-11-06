@@ -1,6 +1,7 @@
+import { isOpenCodeProvider } from "@oh-my-pi/pi-catalog/wire/opencode";
 import { resolveExtraCa, withExtraCaInit } from "@oh-my-pi/pi-utils";
 import { coworkFetch } from "../providers/cowork-fetch";
-import { withInferenceUserAgent } from "../providers/inference-headers";
+import { withInferenceUserAgent, withoutSdkTelemetryHeaders } from "../providers/inference-headers";
 import type { Api, FetchImpl, Model } from "../types";
 import { getProxyForProvider, withProxyInit } from "./proxy";
 import { createFetchRequestDebugSession, isRequestDebugEnabled } from "./request-debug";
@@ -41,6 +42,9 @@ export function transportFetch(
 			recordDispatchOrigin(model, input);
 		}
 		init = withInferenceUserAgent(input, init);
+		// OpenCode gateways read the client identity, and an `x-stainless-*`
+		// header names a language SDK that did not author the request.
+		if (isOpenCodeProvider(model.providerType ?? model.provider)) init = withoutSdkTelemetryHeaders(init);
 		const extraCa = resolveExtraCa();
 		if (extraCa) init = withExtraCaInit(init, extraCa);
 		if (proxyUrl) init = withProxyInit(input, init, proxyUrl);

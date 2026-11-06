@@ -4,6 +4,7 @@ import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { clinePassClientHeaders } from "@oh-my-pi/pi-catalog/wire/cline-pass";
+import { requiresOpenCodeEnvironment } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	logger,
@@ -2502,7 +2503,7 @@ export function convertMessages(
 	};
 
 	const normalizedPrompts = normalizeSystemPrompts(context.systemPrompt);
-	const systemPrompts = compat.requiresOpenCodeEnvironment
+	const systemPrompts = requiresOpenCodeEnvironment(model)
 		? ensureOpenCodeSystemPrompt(normalizedPrompts, cwd)
 		: normalizedPrompts;
 	if (systemPrompts.length > 0) {

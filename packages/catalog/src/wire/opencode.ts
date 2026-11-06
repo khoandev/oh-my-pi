@@ -8,8 +8,17 @@
  * ([#12306](https://github.com/can1357/oh-my-pi/issues/12306)).
  */
 
+import { resolveModelPolicy } from "../compat/resolve";
+import type { Api, CatalogPolicyInputs, ModelSpec } from "../types";
+
 /** Canonical OpenCode client User-Agent; the gate reads only the leading token. */
 export const OPENCODE_USER_AGENT = "opencode/1.19.3";
+
+/**
+ * What the free tier expects as a credential: the literal `public`, not an
+ * account key — the gate runs before any credential is evaluated.
+ */
+export const OPENCODE_PUBLIC_KEY = "public";
 
 /** Provider ids whose hosts sit behind the OpenCode gateways (Zen, Go). */
 export const OPENCODE_PROVIDER_IDS: ReadonlySet<string> = new Set(["opencode-zen", "opencode-go"]);
@@ -17,6 +26,57 @@ export const OPENCODE_PROVIDER_IDS: ReadonlySet<string> = new Set(["opencode-zen
 /** Whether `provider` is served by an OpenCode gateway. */
 export function isOpenCodeProvider(provider: string): boolean {
 	return OPENCODE_PROVIDER_IDS.has(provider);
+}
+
+/**
+ * Model facts the gate read needs: the policy-cascade inputs a model or a
+ * discovery spec both carry, plus the compat surface a built row exposes.
+ */
+export interface OpenCodeEnvironmentInput extends CatalogPolicyInputs {
+	/** Resolved compat of a built row (absent on authored specs). */
+	compat?: object;
+	/** Sparse authored overlay (`Model.compatConfig`) the rule engine folds in. */
+	compatConfig?: unknown;
+}
+
+/** The single compat field the gate read needs, read off an erased compat record. */
+type EnvironmentCompat = { requiresOpenCodeEnvironment?: boolean };
+
+/** One resolution per distinct model; the rule walk is too costly per request. */
+const ENVIRONMENT_CACHE_LIMIT = 8192;
+const openCodeEnvironmentCache = new Map<string, boolean>();
+
+/**
+ * Whether a model's route carries the OpenCode free-tier gate contract
+ * (`requires-opencode-environment` in the provider KDL), and therefore needs
+ * the client identity, the `<env>` block and the gate tool names.
+ *
+ * Prefers the row's resolved `compat`, and otherwise asks the rule tree
+ * directly: `models.json` is a frozen census, and a discovery cache can hold a
+ * row baked by an older build, so a rule authored after the last `gen:models`
+ * run reaches shipped binaries only through `compat/rules.json`. A row that
+ * silently misses the flag ships neither `x-opencode-client` nor the `<env>`
+ * block, which the gateway answers with `429 FreeUsageLimitError`
+ * ([#17075](https://github.com/can1357/oh-my-pi/pull/17075)).
+ *
+ * Resolutions are memoized per model — the cascade is cheap once per process
+ * and too costly per request.
+ */
+export function requiresOpenCodeEnvironment(model: OpenCodeEnvironmentInput): boolean {
+	if (!isOpenCodeProvider(model.providerType ?? model.provider)) return false;
+	const baked = (model.compat as EnvironmentCompat | undefined)?.requiresOpenCodeEnvironment;
+	if (baked !== undefined) return baked;
+	const key = `${model.provider}\u0000${model.providerType ?? ""}\u0000${model.api}\u0000${model.id}`;
+	const cached = openCodeEnvironmentCache.get(key);
+	if (cached !== undefined) return cached;
+	// Hand the engine the sparse authored overlay, never the baked record it
+	// produced (mirrors the bake↔runtime parity gate).
+	const { compat: _bakedCompat, compatConfig, ...inputs } = model;
+	const policy = resolveModelPolicy({ ...inputs, compat: compatConfig } as unknown as ModelSpec<Api>);
+	const resolved = (policy.compat as EnvironmentCompat | undefined)?.requiresOpenCodeEnvironment === true;
+	if (openCodeEnvironmentCache.size >= ENVIRONMENT_CACHE_LIMIT) openCodeEnvironmentCache.clear();
+	openCodeEnvironmentCache.set(key, resolved);
+	return resolved;
 }
 
 /**

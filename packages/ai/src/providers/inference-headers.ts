@@ -168,6 +168,40 @@ function isHeaderRecord(headers: RequestInit["headers"]): headers is Record<stri
 	return headers !== undefined && !(headers instanceof Headers) && !Array.isArray(headers);
 }
 
+/** SDK telemetry header prefix (`x-stainless-*`). */
+const SDK_TELEMETRY_PREFIX = "x-stainless-";
+
+/**
+ * Drop the SDK's `x-stainless-*` telemetry headers from `init`.
+ *
+ * The OpenCode gateways attribute a request by client identity, and those
+ * headers name a language SDK that did not author it (the upstream client
+ * ships none). Stripped at the dispatch boundary so client-level
+ * `defaultHeaders` — the Anthropic lane's SDK fingerprint included — cannot
+ * reintroduce them. Returns `init` unchanged when no such header is present.
+ */
+export function withoutSdkTelemetryHeaders(init: RequestInit | undefined): RequestInit | undefined {
+	const source = init?.headers;
+	if (source === undefined) return init;
+	const isTelemetry = (name: string) => name.toLowerCase().startsWith(SDK_TELEMETRY_PREFIX);
+	if (source instanceof Headers) {
+		const names = [...source.keys()].filter(isTelemetry);
+		if (names.length === 0) return init;
+		const headers = new Headers(source);
+		for (const name of names) headers.delete(name);
+		return { ...init, headers };
+	}
+	if (Array.isArray(source)) {
+		const kept = source.filter(([name]) => !isTelemetry(name));
+		return kept.length === source.length ? init : { ...init, headers: kept };
+	}
+	const names = Object.keys(source).filter(isTelemetry);
+	if (names.length === 0) return init;
+	const headers = { ...source };
+	for (const name of names) delete headers[name];
+	return { ...init, headers };
+}
+
 /**
  * Return `init` with omp's process-wide inference User-Agent default applied.
  * Any explicit header, including Anthropic and Codex OAuth fingerprints,

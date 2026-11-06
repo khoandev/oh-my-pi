@@ -1,5 +1,6 @@
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { resolveResponsesWebSocketPreference } from "@oh-my-pi/pi-catalog/compat/responses-websocket";
+import { requiresOpenCodeEnvironment } from "@oh-my-pi/pi-catalog/wire/opencode";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import {
 	$flag,
@@ -1825,7 +1826,7 @@ export function buildParams(
 	});
 
 	const normalizedPrompts = normalizeSystemPrompts(context.systemPrompt);
-	const systemPrompts = model.compat.requiresOpenCodeEnvironment
+	const systemPrompts = requiresOpenCodeEnvironment(model)
 		? ensureOpenCodeSystemPrompt(normalizedPrompts, options?.cwd)
 		: normalizedPrompts;
 	let systemInstructions: string | undefined;

@@ -3,6 +3,7 @@ import { getEnvApiKey } from "../env-api-key";
 import type { Context, Model, StreamFunction } from "../types";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { applyInferenceHeaders } from "./inference-headers";
+import { requiresOpenCodeEnvironment } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	buildGoogleGenerateContentParams,
 	type GoogleGenAIRequestPlan,
@@ -47,8 +48,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai"> = (
 				providerType: model.providerType,
 				protocol: "google",
 				sessionId: options?.sessionId ?? options?.promptCacheKey,
-				requiresOpenCodeClient: (model.compat as { requiresOpenCodeEnvironment?: boolean })
-					?.requiresOpenCodeEnvironment,
+				requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 			});
 			return { params, url, headers, fetch: options?.fetch };
 		},
