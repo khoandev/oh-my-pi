@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { buildModel } from "../src/build";
 import type { ModelSpec } from "../src/types";
-import { requiresOpenCodeEnvironment } from "../src/wire/opencode";
+import { requiresOpenCodeEnvironment, toOpenCodeProjectId } from "../src/wire/opencode";
 
 /**
  * The free-tier gate is a provider deployment contract, so the decision has to
@@ -70,5 +73,23 @@ describe("requiresOpenCodeEnvironment", () => {
 		const built = buildModel(zenSpec("deepseek-v4.1-flash-free", { provider: "openai", baseUrl: undefined }));
 
 		expect(requiresOpenCodeEnvironment(built)).toBe(false);
+	});
+
+	test("derives x-opencode-project from the canonical worktree root", async () => {
+		// The released CLI sends the SHA-1 of the worktree root, not of the
+		// directory a turn happens to start in, so a subdirectory session keeps
+		// the repository's project identity.
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-opencode-project-"));
+		try {
+			await fs.mkdir(path.join(root, ".git"));
+			const sub = path.join(root, "packages", "ai");
+			await fs.mkdir(sub, { recursive: true });
+			const expected = new Bun.CryptoHasher("sha1").update(await fs.realpath(root)).digest("hex");
+
+			expect(toOpenCodeProjectId(sub)).toBe(expected);
+			expect(toOpenCodeProjectId(root)).toBe(expected);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });

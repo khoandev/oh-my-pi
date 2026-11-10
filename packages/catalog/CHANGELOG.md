@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode discovery requests and the exported wire identity now match the 2.2.7 client: `opencode/latest/2.2.7/cli` User-Agent, `x-opencode-client`, four session-header spellings, and the `x-opencode-project` worktree identity
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

@@ -5,7 +5,7 @@ import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamAnthropic } from "../src/providers/anthropic";
 import { USER_AGENT } from "@oh-my-pi/pi-utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { OPENCODE_USER_AGENT } from "@oh-my-pi/pi-catalog/wire/opencode";
+import { OPENCODE_USER_AGENT, toOpenCodeProjectId } from "@oh-my-pi/pi-catalog/wire/opencode";
 import type { FetchImpl } from "../src/types";
 
 const OPENCODE_ZEN_DEEPSEEK_FREE_MODEL = buildModel({
@@ -61,6 +61,12 @@ describe("OpenCode Zen / Go inference compatibility", () => {
 			expect(headers["User-Agent"]).toBe(`${OPENCODE_USER_AGENT} (${USER_AGENT})`);
 			expect(headers["x-opencode-client"]).toBe("cli");
 			expect(headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+			// The released CLI sends the same affinity token under four spellings,
+			// and names the project it is working in.
+			for (const name of ["x-opencode-session-id", "x-session-affinity", "X-Session-Id"]) {
+				expect(headers[name]).toBe(headers["x-opencode-session"]);
+			}
+			expect(headers["x-opencode-project"]).toBe(toOpenCodeProjectId(process.cwd()));
 		});
 
 		it("preserves the OpenCode client identity and minted session for Go subscriber lanes", () => {
@@ -190,6 +196,7 @@ describe("OpenCode Zen / Go inference compatibility", () => {
 			expect(capturedHeaders["user-agent"]).toBe(`${OPENCODE_USER_AGENT} (${USER_AGENT})`);
 			expect(capturedHeaders["x-opencode-client"]).toBe("cli");
 			expect(capturedHeaders["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+			expect(capturedHeaders["x-opencode-project"]).toBe(toOpenCodeProjectId("/test/session/path"));
 			expect(capturedHeaders["authorization"]).toBe("Bearer public");
 
 			// System prompt contains <env> with session cwd

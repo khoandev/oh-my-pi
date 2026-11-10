@@ -8,11 +8,19 @@
  * ([#12306](https://github.com/can1357/oh-my-pi/issues/12306)).
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { resolveModelPolicy } from "../compat/resolve";
 import type { Api, CatalogPolicyInputs, ModelSpec } from "../types";
 
-/** Canonical OpenCode client User-Agent; the gate reads only the leading token. */
-export const OPENCODE_USER_AGENT = "opencode/1.19.3";
+/**
+ * Canonical OpenCode client User-Agent. The released CLI spells it
+ * `opencode/<channel>/<version>/<client>`; the gate reads the leading token.
+ */
+export const OPENCODE_USER_AGENT = "opencode/latest/2.2.7/cli";
+
+/** What the released CLI reports as `x-opencode-client`. */
+export const OPENCODE_CLIENT_NAME = "cli";
 
 /**
  * What the free tier expects as a credential: the literal `public`, not an
@@ -26,6 +34,70 @@ export const OPENCODE_PROVIDER_IDS: ReadonlySet<string> = new Set(["opencode-zen
 /** Whether `provider` is served by an OpenCode gateway. */
 export function isOpenCodeProvider(provider: string): boolean {
 	return OPENCODE_PROVIDER_IDS.has(provider);
+}
+
+/**
+ * Canonical project root the CLI attributes a request to: the nearest ancestor
+ * holding a `.git` entry, resolved through symlinks (so a turn started in a
+ * worktree subdirectory carries the repository's identity). A path outside any
+ * repository is its own project, which is what the CLI records for a plain
+ * directory.
+ */
+export function openCodeProjectRoot(cwd: string): string {
+	const start = path.resolve(cwd);
+	let dir = start;
+	for (;;) {
+		if (fs.existsSync(path.join(dir, ".git"))) break;
+		const parent = path.dirname(dir);
+		if (parent === dir) {
+			dir = start;
+			break;
+		}
+		dir = parent;
+	}
+	try {
+		return fs.realpathSync(dir);
+	} catch {
+		return dir;
+	}
+}
+
+/** Bound the project-id memo; a long-lived process sees few distinct roots. */
+const OPENCODE_PROJECT_ID_CACHE_LIMIT = 64;
+const openCodeProjectIdCache = new Map<string, string>();
+
+/**
+ * `x-opencode-project`: the SHA-1 of the canonical project root, in the exact
+ * spelling the released CLI sends.
+ */
+export function toOpenCodeProjectId(cwd?: string): string {
+	let resolved: string;
+	try {
+		resolved = path.resolve(cwd ?? process.cwd());
+	} catch {
+		resolved = cwd ?? ".";
+	}
+	const cached = openCodeProjectIdCache.get(resolved);
+	if (cached !== undefined) return cached;
+	const projectId = new Bun.CryptoHasher("sha1").update(openCodeProjectRoot(resolved)).digest("hex");
+	if (openCodeProjectIdCache.size >= OPENCODE_PROJECT_ID_CACHE_LIMIT) openCodeProjectIdCache.clear();
+	openCodeProjectIdCache.set(resolved, projectId);
+	return projectId;
+}
+
+/**
+ * The conversation-identity headers the released CLI sends for one request.
+ * The same affinity token answers to all four spellings the gateway recognises,
+ * and `x-opencode-project` names the project the conversation belongs to.
+ */
+export function openCodeSessionHeaders(token: string, cwd?: string): Record<string, string> {
+	return {
+		"x-opencode-session": token,
+		"x-opencode-session-id": token,
+		"x-session-affinity": token,
+		"X-Session-Id": token,
+		"x-opencode-project": toOpenCodeProjectId(cwd),
+	};
 }
 
 /**

@@ -202,6 +202,8 @@ export interface OpenAIRequestSetupOptions {
 	 * flip `x-opencode-session` on opted-in lanes.
 	 */
 	promptCacheAffinityKey?: string;
+	/** Conversation working directory, used for the OpenCode project identity. */
+	cwd?: string;
 }
 
 export interface OpenAIRequestSetup {
@@ -373,6 +375,7 @@ export function resolveOpenAIRequestSetup(
 		sessionId,
 		cacheAffinity: resolveOpenCodeGoCacheAffinity(model, options.promptCacheAffinityKey),
 		requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
+		cwd: options.cwd,
 	});
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenCode Zen/Go free-tier requests failing with `429 FreeUsageLimitError` after the OpenCode 2.2.7 client update: requests now carry the `opencode/latest/2.2.7/cli` User-Agent, the session affinity token under all four header spellings, and the `x-opencode-project` worktree identity
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

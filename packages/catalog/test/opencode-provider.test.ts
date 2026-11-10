@@ -17,7 +17,11 @@ import {
 	opencodeZenModelManagerOptions,
 } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
-import { OPENCODE_SESSION_TOKEN_PATTERN, OPENCODE_USER_AGENT } from "@oh-my-pi/pi-catalog/wire/opencode";
+import {
+	OPENCODE_SESSION_TOKEN_PATTERN,
+	OPENCODE_USER_AGENT,
+	toOpenCodeProjectId,
+} from "@oh-my-pi/pi-catalog/wire/opencode";
 import type { FetchImpl } from "@oh-my-pi/pi-utils";
 import { mergePreviousSnapshotModels } from "../scripts/generate-models";
 
@@ -986,7 +990,12 @@ describe("OpenCode provider discovery", () => {
 			await options.fetchDynamicModels?.();
 			expect(seen).toHaveLength(1);
 			expect(seen[0]?.["user-agent"]).toBe(OPENCODE_USER_AGENT);
+			expect(seen[0]?.["x-opencode-client"]).toBe("cli");
 			expect(seen[0]?.["x-opencode-session"]).toMatch(OPENCODE_SESSION_TOKEN_PATTERN);
+			for (const name of ["x-opencode-session-id", "x-session-affinity", "x-session-id"]) {
+				expect(seen[0]?.[name]).toBe(seen[0]?.["x-opencode-session"]);
+			}
+			expect(seen[0]?.["x-opencode-project"]).toBe(toOpenCodeProjectId());
 		}
 	});
 

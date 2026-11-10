@@ -50,7 +50,12 @@ import { normalizeCharmHyperBaseUrl } from "../wire/charm-hyper";
 import { CLINEPASS_API_BASE_URL, clinePassClientHeaders } from "../wire/cline-pass";
 import { CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL } from "../wire/cloudflare-ai-gateway";
 import { coreWeaveProjectHeaders } from "../wire/coreweave";
-import { OPENCODE_USER_AGENT, toOpenCodeSessionToken } from "../wire/opencode";
+import {
+	OPENCODE_CLIENT_NAME,
+	OPENCODE_USER_AGENT,
+	openCodeSessionHeaders,
+	toOpenCodeSessionToken,
+} from "../wire/opencode";
 import {
 	COPILOT_API_HEADERS,
 	COPILOT_DISCOVERY_HEADERS,
@@ -3434,7 +3439,8 @@ function openCodeModelManagerOptions(
 					// instead of Bun's default.
 					headers: {
 						"User-Agent": OPENCODE_USER_AGENT,
-						"x-opencode-session": toOpenCodeSessionToken(getInstallId()),
+						"x-opencode-client": OPENCODE_CLIENT_NAME,
+						...openCodeSessionHeaders(toOpenCodeSessionToken(getInstallId())),
 					},
 					mapModel: (entry, defaults) => {
 						const reference = references.get(defaults.id);

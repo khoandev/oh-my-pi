@@ -1,4 +1,9 @@
-import { OPENCODE_USER_AGENT, toOpenCodeSessionToken } from "@oh-my-pi/pi-catalog/wire/opencode";
+import {
+	OPENCODE_CLIENT_NAME,
+	OPENCODE_USER_AGENT,
+	openCodeSessionHeaders,
+	toOpenCodeSessionToken,
+} from "@oh-my-pi/pi-catalog/wire/opencode";
 import { getInstallId } from "@oh-my-pi/pi-utils";
 import { ProviderHttpError } from "../error";
 import type {
@@ -113,7 +118,8 @@ async function fetchOpenCodeGoUsage(params: UsageFetchParams, ctx: UsageFetchCon
 				// canonical OpenCode client identity (x-opencode-session +
 				// opencode/* UA, see wire/opencode) instead of Bun's default.
 				"User-Agent": OPENCODE_USER_AGENT,
-				"x-opencode-session": toOpenCodeSessionToken(getInstallId()),
+				"x-opencode-client": OPENCODE_CLIENT_NAME,
+				...openCodeSessionHeaders(toOpenCodeSessionToken(getInstallId())),
 			},
 			signal: params.signal,
 		});
