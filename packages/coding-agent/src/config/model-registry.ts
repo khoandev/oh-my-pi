@@ -3412,6 +3412,12 @@ export class ModelRegistry {
 	#createProviderAvailabilityCheck(): (provider: string) => boolean {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const byProvider = new Map<string, boolean>();
+		const unauthenticated = new Set(
+			PROVIDER_DESCRIPTORS.filter(
+				descriptor =>
+					descriptor.allowUnauthenticated === true || descriptor.catalogDiscovery?.allowUnauthenticated === true,
+			).map(descriptor => descriptor.providerId),
+		);
 		return provider => {
 			let available = byProvider.get(provider);
 			if (available === undefined) {
@@ -3420,10 +3426,13 @@ export class ModelRegistry {
 				// configured-but-keyless: `hasAuth` no longer counts it, but its
 				// models stay usable exactly like an `auth: none` endpoint's
 				// (issue #12281). Implicit local providers are already covered
-				// by `#keylessProviders`.
+				// by `#keylessProviders`. Providers declaring
+				// `allow-unauthenticated` (e.g. OpenCode Zen's `public` free tier)
+				// expose their roster from a clean store with no login at all.
 				available =
 					!disabledProviders.has(provider) &&
-					(this.#keylessProviders.has(provider) ||
+					(unauthenticated.has(provider) ||
+						this.#keylessProviders.has(provider) ||
 						this.authStorage.keys.source(provider) !== undefined ||
 						this.authStorage.keys.keyless(provider));
 				byProvider.set(provider, available);

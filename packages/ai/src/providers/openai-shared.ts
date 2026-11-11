@@ -251,10 +251,15 @@ export function resolveOpenAIRequestSetup(
 	let apiKey = options.apiKey;
 	const isOpenCode = model.provider === "opencode-zen" || model.provider === "opencode-go";
 	const isFreeModel = !model.cost?.input || model.cost.input === 0;
-	if (!apiKey) {
-		if (isOpenCode && isFreeModel) {
-			apiKey = OPENCODE_PUBLIC_KEY;
-		} else if (!$env.OPENAI_API_KEY) {
+	// An anonymous OpenCode free-tier login stores the `public` marker, which
+	// the credential cascade resolves to the `N/A` no-auth sentinel. The free
+	// gateway still expects the literal `public` bearer, so treat the sentinel
+	// as "no key" here and let the transport inject the public credential.
+	const isOpenCodeKeyless = isOpenCode && isFreeModel && (!apiKey || apiKey === NO_AUTH_SENTINEL);
+	if (isOpenCodeKeyless) {
+		apiKey = OPENCODE_PUBLIC_KEY;
+	} else if (!apiKey) {
+		if (!$env.OPENAI_API_KEY) {
 			throw new AIError.MissingApiKeyError(
 				isOpenCode ? model.provider : undefined,
 				isOpenCode

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- OpenCode Zen free models appear in the model picker from a clean install with no `/login`, usable anonymously like the upstream opencode CLI (`allow-unauthenticated` providers are now counted as available)
+
 ## [18.18.8] - 2026-11-11
 
 ### Changed

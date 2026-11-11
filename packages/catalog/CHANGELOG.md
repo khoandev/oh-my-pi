@@ -9,6 +9,7 @@
 ### Fixed
 
 - OpenCode Zen free models no longer answer `429 FreeUsageLimitError` when a cached model row carries a stale `requiresOpenCodeEnvironment: false` — only a baked `true` short-circuits, so the rule tree re-gates the request and ships the `<env>` block
+- OpenCode Zen free models are now usable with no login or API key, matching the anonymous `public` free tier of the upstream opencode CLI (`allows-missing-api-key` + `allow-unauthenticated` in the auth/provider rules)
 - OpenCode discovery requests and the exported wire identity now match the 2.2.7 client: `opencode/latest/2.2.7/cli` User-Agent, `x-opencode-client`, four session-header spellings, and the `x-opencode-project` worktree identity
 ## [18.18.8] - 2026-11-11
 

@@ -961,7 +961,11 @@ function streamDispatch<TApi extends Api>(
 	const providerModel = prepared?.model ?? requestModel;
 	const preparedOptions = prepared?.options ?? (requestOptions as StreamOptions);
 	const apiKey = preparedOptions.apiKey || getEnvApiKey(providerModel.provider);
-	if (!apiKey) {
+	// Providers that declare `allows-missing-api-key` (e.g. OpenCode Zen's
+	// anonymous free tier) authenticate inside their transport: it injects the
+	// public credential after the client-identity gate. Let a keyless request
+	// through instead of failing here before the wire layer can run.
+	if (!apiKey && !providerDefinition?.allowsMissingApiKey) {
 		throw new AIError.MissingApiKeyError(providerModel.provider);
 	}
 	const providerOptions = isGoogleVertexAuthenticatedModel(providerModel)

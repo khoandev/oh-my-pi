@@ -4033,8 +4033,11 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	// OpenCode's free tier takes the literal `public` as its credential and
 	// reads it after the client-identity gate; an empty `X-Api-Key` is a shape
 	// it does not accept. A configured key is never replaced, so OAuth and
-	// account keys on the paid lanes of the same provider keep working.
-	const apiKey = configuredApiKey || (requiresOpenCodeEnvironment(model) ? OPENCODE_PUBLIC_KEY : "");
+	// account keys on the paid lanes of the same provider keep working. An
+	// anonymous login resolves to the `N/A` no-auth sentinel; treat it as no
+	// key so the free-tier public credential is injected instead of `N/A`.
+	const configured = configuredApiKey === NO_AUTH_SENTINEL ? "" : configuredApiKey;
+	const apiKey = configured || (requiresOpenCodeEnvironment(model) ? OPENCODE_PUBLIC_KEY : "");
 	const compat = model.compat;
 	const disableStrictTools = disableStrictToolsOverride ?? compat.disableStrictTools;
 	const baseUrl = resolveAnthropicBaseUrl(model, apiKey);

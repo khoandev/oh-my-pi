@@ -1,5 +1,10 @@
 auth "opencode-zen" {
 	name "OpenCode Zen"
+	// The free tier is usable with no stored credential at all, like the
+	// upstream opencode CLI: the wire layer sends the literal `public` bearer
+	// once the client-identity gate is met. Let a request with no key through
+	// instead of failing it before the transport can inject that credential.
+	allows-missing-api-key #true
 	login "api-key" {
 		// Both subscription services issue keys from the same Zen console.
 		auth-url "https://opencode.ai/auth"

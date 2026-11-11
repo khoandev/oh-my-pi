@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Anonymous OpenCode Zen free-tier sessions now send the `Bearer public` credential instead of dropping authorization: a keyless request passes the generic stream dispatch (`allows-missing-api-key`), and the `N/A` no-auth sentinel from a keyless login is treated as no key on both OpenAI- and Anthropic-routed free models
+
 ## [18.18.8] - 2026-11-11
 
 - Fixed provider in-flight lock cleanup failures being swallowed silently — they are now logged instead of ignored ([#18654](https://github.com/can1357/oh-my-pi/pull/18654) by [@yuzu-octopus](https://github.com/yuzu-octopus))

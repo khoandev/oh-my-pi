@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { applyInferenceHeaders, ensureOpenCodeSystemPrompt } from "../src/providers/inference-headers";
 import { resolveOpenAIRequestSetup } from "../src/providers/openai-shared";
+import { NO_AUTH_SENTINEL } from "../src/auth-retry";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamAnthropic } from "../src/providers/anthropic";
+import { streamSimple } from "../src/stream";
 import { USER_AGENT } from "@oh-my-pi/pi-utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { OPENCODE_USER_AGENT, toOpenCodeProjectId } from "@oh-my-pi/pi-catalog/wire/opencode";
@@ -126,6 +128,18 @@ describe("OpenCode Zen / Go inference compatibility", () => {
 			expect(setup.headers.Authorization).toBe("Bearer public");
 		});
 
+		it("injects Bearer public for the N/A no-auth sentinel from an anonymous login", () => {
+			// An empty paste at the Zen login prompt stores the `public` marker,
+			// which the credential cascade resolves to the `N/A` no-auth sentinel.
+			// The free gateway still expects the literal `public` bearer — without
+			// this fallback the anonymous session sends no Authorization at all.
+			const setup = resolveOpenAIRequestSetup(OPENCODE_ZEN_DEEPSEEK_FREE_MODEL, {
+				apiKey: NO_AUTH_SENTINEL,
+				messages: [],
+			});
+			expect(setup.headers.Authorization).toBe("Bearer public");
+		});
+
 		it("uses explicit user API key when configured", () => {
 			const setup = resolveOpenAIRequestSetup(OPENCODE_ZEN_DEEPSEEK_FREE_MODEL, {
 				apiKey: "oc_sk_test_key_12345",
@@ -243,5 +257,27 @@ describe("OpenCode Zen / Go inference compatibility", () => {
 			const messages = capturedBody.messages as Array<{ role: string; content: string }>;
 			expect(messages.some(m => m.role === "system" && m.content.includes("<env>"))).toBe(true);
 		});
+	});
+
+	it("a no-key free-tier request reaches the wire with Bearer public", async () => {
+		// The generic stream dispatch used to throw MissingApiKeyError before
+		// the transport could inject the anonymous free-tier credential. With
+		// `allows-missing-api-key`, a keyless request must still dispatch.
+		let authorization = "(none)";
+		const fetchMock: FetchImpl = async (_input, init) => {
+			authorization = new Headers(init?.headers).get("authorization") ?? "(none)";
+			return new Response('data: {"id":"1","choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+				status: 200,
+				headers: { "Content-Type": "text/event-stream" },
+			});
+		};
+		const stream = streamSimple(
+			OPENCODE_ZEN_DEEPSEEK_FREE_MODEL,
+			{ messages: [{ role: "user", content: "ping", timestamp: 0 }] },
+			{ apiKey: undefined, maxHttpAttempts: 1, fetch: fetchMock },
+		);
+		const result = await stream.result();
+		expect(result.stopReason).not.toBe("error");
+		expect(authorization).toBe("Bearer public");
 	});
 });
