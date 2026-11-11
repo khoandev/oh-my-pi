@@ -181,6 +181,17 @@ export function isExcludedModel(provider: string, model: string): boolean {
 	return behavior.excludeModels.some(rule => rule.provider === provider && matchesList(rule.match, lower, lower));
 }
 
+/**
+ * Whether a provider's roster allow-list keeps `model` listed. Providers
+ * without an `include-models` rule list everything `isExcludedModel` allows.
+ */
+export function isIncludedModel(provider: string, model: string): boolean {
+	const rules = behavior.includeModels.filter(rule => rule.provider === provider);
+	if (rules.length === 0) return true;
+	const lower = model.toLowerCase();
+	return rules.some(rule => matchesList(rule.match, lower, lower));
+}
+
 /** Whether an exact upstream discovery mode is excluded from a provider's coding-model roster. */
 export function isExcludedDiscoveryMode(provider: string, mode: string): boolean {
 	return behavior.excludeDiscoveryModes.some(rule => rule.provider === provider && rule.modes.includes(mode));

@@ -7,6 +7,7 @@ import {
 	isBareIdReferenceProvider,
 	isExcludedDiscoveryMode,
 	isExcludedModel,
+	isIncludedModel,
 	isLikelyOpenAIResponsesId,
 	modelLimitsFor,
 } from "../compat/behavior";
@@ -3420,6 +3421,7 @@ function openCodeModelManagerOptions(
 				if (!isRecord(payload)) return [];
 				return mapModelsDevToModels(payload, OPENCODE_MODELS_DEV_DESCRIPTORS)
 					.filter(model => model.provider === providerId)
+					.filter(model => isIncludedModel(providerId, model.id))
 					.map(model => {
 						const api = resolveApi(model.id, "openai-completions");
 						return { ...model, api, baseUrl: openCodeBaseUrlForApi(api, basePath) };
@@ -3494,7 +3496,12 @@ function openCodeModelManagerOptions(
 				if (!discovered) return null;
 				const seeds = seedModels(providerId).map(seed => ({ ...seed, baseUrl: basePath }));
 				const seedIds = new Set(seeds.map(seed => seed.id));
-				return [...discovered.filter(model => !seedIds.has(model.id)), ...seeds];
+				// The roster allow-list (`include-models` in the provider rules)
+				// decides what the picker may offer; the gateway's paid SKUs are not
+				// callable with the free-tier credential, so they stay out.
+				return [...discovered.filter(model => !seedIds.has(model.id)), ...seeds].filter(model =>
+					isIncludedModel(providerId, model.id),
+				);
 			},
 		}),
 	};

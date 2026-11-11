@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- OpenCode Zen lists only the free tier in the model picker: `include-models` is a new roster allow-list in the runtime behavior rules, and Zen's paid SKUs — unreachable with the contributor `Bearer public` credential — are hidden along with every id the gateway no longer serves
+
 ### Fixed
 
 - OpenCode Zen free models no longer answer `429 FreeUsageLimitError` when a cached model row carries a stale `requiresOpenCodeEnvironment: false` — only a baked `true` short-circuits, so the rule tree re-gates the request and ships the `<env>` block

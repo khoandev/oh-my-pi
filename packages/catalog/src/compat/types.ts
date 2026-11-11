@@ -310,6 +310,16 @@ export interface CompiledExcludeModels {
 	match: CompiledMatchList;
 }
 
+/**
+ * Roster allow-list for one provider. A provider that declares one lists only
+ * the ids that match it; every other row stays out of the picker even when
+ * discovery advertises it.
+ */
+export interface CompiledIncludeModels {
+	provider: string;
+	match: CompiledMatchList;
+}
+
 /** Exact upstream discovery modes excluded from one provider's coding-model roster. */
 export interface CompiledExcludeDiscoveryModes {
 	provider: string;
@@ -347,6 +357,7 @@ export interface CompiledBehavior {
 	modelLimits: CompiledModelLimits[];
 	excludeDiscoveryModes: CompiledExcludeDiscoveryModes[];
 	excludeModels: CompiledExcludeModels[];
+	includeModels: CompiledIncludeModels[];
 	planRequirements: CompiledPlanRequirement[];
 	pricingPeers: CompiledPricingPeer[];
 	retryResetTimezones: CompiledRetryResetTimezone[];

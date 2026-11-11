@@ -291,6 +291,11 @@ behavior {
 	// listing carries no transport metadata; both model lines are served only
 	// at /responses (#10610, #12030). The Muse prefix covers gateway-first
 	// revisions; exact ids stay as cache-migration identity.
+	// Zen's paid SKUs need an OpenCode Go subscription: the contributor
+	// credential (`Bearer public`) can only call the free tier, so the picker
+	// lists exactly what that credential can run. Ids the gateway no longer
+	// serves leave with the roster, because discovery is authoritative here.
+	include-models provider="opencode-zen" glob="*-free" exact="big-pickle"
 	api-routes provider="opencode-zen" {
 		// Paid Argon is served only on Zen's native Google endpoint (#15977).
 		route "google-generative-ai" exact="gemini-4-argon"

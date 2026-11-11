@@ -4,7 +4,7 @@
  * Ports the o2 runtime-behavior grammar (openai-responses-heuristic,
  * model-operations, cursor-effort, cursor-model-parameter, quota-tiers,
  * hosted-default) and adds the pi-only nodes: api-routes, model-limits,
- * exclude-discovery-modes, exclude-models, plan-requirement, pricing-peer,
+ * exclude-discovery-modes, exclude-models, include-models, plan-requirement, pricing-peer,
  * retry-reset-timezone, and role-defaults.
  * Every node kind is optional; per-node shapes are strict.
  */
@@ -13,6 +13,7 @@ import type {
 	CompiledBehavior,
 	CompiledExcludeDiscoveryModes,
 	CompiledExcludeModels,
+	CompiledIncludeModels,
 	CompiledMatchList,
 	CompiledModelLimits,
 	CompiledModelOperations,
@@ -324,6 +325,7 @@ export function compileBehavior(source: { file: string; text: string } | undefin
 		modelLimits: [],
 		excludeDiscoveryModes: [],
 		excludeModels: [],
+		includeModels: [],
 		retiredProviders: [],
 		referenceIsolatedProviders: [],
 		appendOnlyContextProviders: [],
@@ -392,6 +394,10 @@ export function compileBehavior(source: { file: string; text: string } | undefin
 				break;
 			case "exclude-models":
 				behavior.excludeModels.push(parseExcludeModels(node));
+				break;
+			case "include-models":
+				// Same matcher grammar as `exclude-models`; only the roster verdict differs.
+				behavior.includeModels.push(parseExcludeModels(node));
 				break;
 			case "plan-requirement":
 				behavior.planRequirements.push(parsePlanRequirement(node));
