@@ -5,6 +5,7 @@
 ### Added
 
 - OpenCode Zen free models appear in the model picker from a clean install with no `/login`, usable anonymously like the upstream opencode CLI (`allow-unauthenticated` providers are now counted as available)
+- Extensions can import the form theme, the native span helpers (`styledSpans`, `compactText`, `rowsText` and the rest of the ANSI/span conversions), the `xd://` URL helpers (`parseXdUrl` and friends) and the `cfgExtensionTranscriptPresenters` setting handle from `@oh-my-pi/pi-coding-agent` instead of internal module paths, which stop the extension from loading when a file moves ([#18849](https://github.com/can1357/oh-my-pi/pull/18849) by [@materemias](https://github.com/materemias))
 
 ## [18.18.8] - 2026-11-11
 
