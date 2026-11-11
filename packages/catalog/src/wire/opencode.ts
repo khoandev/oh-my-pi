@@ -123,12 +123,15 @@ const openCodeEnvironmentCache = new Map<string, boolean>();
  * (`requires-opencode-environment` in the provider KDL), and therefore needs
  * the client identity, the `<env>` block and the gate tool names.
  *
- * Prefers the row's resolved `compat`, and otherwise asks the rule tree
- * directly: `models.json` is a frozen census, and a discovery cache can hold a
- * row baked by an older build, so a rule authored after the last `gen:models`
- * run reaches shipped binaries only through `compat/rules.json`. A row that
- * silently misses the flag ships neither `x-opencode-client` nor the `<env>`
- * block, which the gateway answers with `429 FreeUsageLimitError`
+ * A baked `true` in the row's resolved `compat` is authoritative. A baked
+ * `false` is not: rows are cached in `models.db`, so a row materialized by an
+ * older build — before the rule existed, or while it was narrower — would
+ * otherwise keep the `<env>` block and the client identity off the request
+ * forever. The gateway answers that request with `429 FreeUsageLimitError`,
+ * and no local state ever corrects itself because the cached `false` always
+ * wins. So only `true` short-circuits; everything else asks the rule tree,
+ * which is the single source of truth (`compat/rules.json` reaches shipped
+ * binaries even when `models.json` is a frozen census)
  * ([#17075](https://github.com/can1357/oh-my-pi/pull/17075)).
  *
  * Resolutions are memoized per model — the cascade is cheap once per process
@@ -137,7 +140,7 @@ const openCodeEnvironmentCache = new Map<string, boolean>();
 export function requiresOpenCodeEnvironment(model: OpenCodeEnvironmentInput): boolean {
 	if (!isOpenCodeProvider(model.providerType ?? model.provider)) return false;
 	const baked = (model.compat as EnvironmentCompat | undefined)?.requiresOpenCodeEnvironment;
-	if (baked !== undefined) return baked;
+	if (baked === true) return true;
 	const key = `${model.provider}\u0000${model.providerType ?? ""}\u0000${model.api}\u0000${model.id}`;
 	const cached = openCodeEnvironmentCache.get(key);
 	if (cached !== undefined) return cached;

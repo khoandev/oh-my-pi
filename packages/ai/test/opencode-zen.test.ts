@@ -207,5 +207,41 @@ describe("OpenCode Zen / Go inference compatibility", () => {
 				),
 			).toBe(true);
 		});
+
+		it("still ships the gate shape when a cached row baked requiresOpenCodeEnvironment false", async () => {
+			// A `models.db` row materialized by an older build carries `false`.
+			// Trusting it drops the `<env>` block, and the gateway answers the
+			// request with `429 FreeUsageLimitError` — the exact failure the free
+			// tier reports when the client shape is not OpenCode's.
+			const staleModel = {
+				...OPENCODE_ZEN_DEEPSEEK_FREE_MODEL,
+				compat: { ...OPENCODE_ZEN_DEEPSEEK_FREE_MODEL.compat, requiresOpenCodeEnvironment: false },
+			};
+			let capturedBody: Record<string, unknown> = {};
+
+			const stream = streamOpenAICompletions(
+				staleModel,
+				{
+					systemPrompt: ["You are omp."],
+					messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
+					tools: [{ name: "read", description: "read file", parameters: { type: "object" } }],
+				},
+				{
+					fetch: async (_input, init) => {
+						capturedBody = JSON.parse(String(init?.body ?? "{}"));
+						return new Response('data: {"id":"1","choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+							status: 200,
+							headers: { "Content-Type": "text/event-stream" },
+						});
+					},
+					cwd: "/test/session/path",
+				},
+			);
+
+			await stream.result();
+
+			const messages = capturedBody.messages as Array<{ role: string; content: string }>;
+			expect(messages.some(m => m.role === "system" && m.content.includes("<env>"))).toBe(true);
+		});
 	});
 });

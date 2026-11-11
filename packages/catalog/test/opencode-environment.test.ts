@@ -51,11 +51,20 @@ describe("requiresOpenCodeEnvironment", () => {
 		expect(requiresOpenCodeEnvironment(stale)).toBe(false);
 	});
 
-	test("honors an explicit baked value over the rule tree", () => {
-		const built = buildModel(zenSpec("deepseek-v4.1-flash-free"));
+	test("re-resolves a baked false through the rule tree instead of trusting it", () => {
+		// A row cached in `models.db` by an older build carries `false`. Trusting
+		// it would keep the `<env>` block off a gated request forever, which the
+		// gateway answers with `429 FreeUsageLimitError`.
+		const free = buildModel(zenSpec("deepseek-v4.1-flash-free"));
+		const paid = buildModel(
+			zenSpec("deepseek-v4.1-flash", { cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 } }),
+		);
 
 		expect(
-			requiresOpenCodeEnvironment({ ...built, compat: { ...built.compat, requiresOpenCodeEnvironment: false } }),
+			requiresOpenCodeEnvironment({ ...free, compat: { ...free.compat, requiresOpenCodeEnvironment: false } }),
+		).toBe(true);
+		expect(
+			requiresOpenCodeEnvironment({ ...paid, compat: { ...paid.compat, requiresOpenCodeEnvironment: false } }),
 		).toBe(false);
 	});
 
