@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [18.22.0] - 2026-11-16
+
+### Fixed
+
+- Improved streaming performance in the collab viewer, preventing long replies from becoming progressively slower as they are received.
+
+## [18.20.1] - 2026-11-14
+
+### Fixed
+
+- Fixed guests retaining stale agents, tool cards, and working state after a failed rejoin; guests now reliably restore the current session state when reconnecting.
+
+## [18.19.0] - 2026-11-12
+
+### Fixed
+
+- Fixed `task` tool cards so spawned tasks consistently display their name, assigned agent, and instructions, with `steps` spawns shown as numbered stages.
+
 ## [18.18.8] - 2026-11-11
 
 ### Changed

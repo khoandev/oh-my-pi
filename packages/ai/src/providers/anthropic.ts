@@ -80,6 +80,7 @@ import {
 	copyPerCallContextMessage,
 	type ConversationalUserCarrier,
 	isConversationalUser,
+	isDemotedThinking,
 	isPerCallContextMessage,
 	isSyntheticUser,
 	kConversationalUser,
@@ -170,6 +171,7 @@ import {
 	isClaudeCloakingUserId,
 	readAnthropicMetadataAccountId,
 	readAnthropicMetadataString,
+	rebindAnthropicMetadataUserId,
 	resolveAnthropicMetadataUserId,
 	stripClaudeToolPrefix,
 } from "./anthropic-identity";
@@ -2035,6 +2037,8 @@ const streamAnthropicOnce = (
 			// body never builds params.
 			let controlRecords: AnthropicControlRecord[] | undefined;
 			const getControlRecords = () => (controlRecords ??= collectAnthropicControlRecords(context.messages));
+			// Other models' reasoning the last build replayed as text, reported on a refusal.
+			let demotedReasoningBlocks = 0;
 			let prefixMismatchBehavior = transport
 				? transport.prefixMismatchBehavior
 				: model.thinking?.prefixBinding && model.compat.supportsThinkingBindingControls
@@ -2325,6 +2329,10 @@ const streamAnthropicOnce = (
 				if (built.requestControls) output.requestControls = built.requestControls;
 				else delete output.requestControls;
 				replayResponse = built.replayResponse;
+				// Counted by the encoder, before `onPayload`: on the wire a demoted block is
+				// plain text (the Claude dialect renders it unwrapped), so the final body
+				// cannot be recounted. A hook that edits reasoning runs again on the retry.
+				demotedReasoningBlocks = built.demotedReasoningBlocks;
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
 				}
@@ -2382,6 +2390,7 @@ const streamAnthropicOnce = (
 			// expired token must fall back to a fresh request as before.
 			if (frozenRedemption && !forfeitFrozenForKillSwitch && Date.now() <= frozenRedemption.expiresAt) {
 				usingFallbackCredit = true;
+				demotedReasoningBlocks = frozenRedemption.demotedReasoningBlocks ?? 0;
 				const echoed =
 					frozenRedemption.prefillClaim !== false && frozenRedemption.refusedContent
 						? formatEchoedRefusalContent(frozenRedemption.refusedContent)
@@ -3187,7 +3196,11 @@ const streamAnthropicOnce = (
 										betaHeader: sentBetaHeader,
 										expiresAt: Date.now() + FALLBACK_CREDIT_TTL_MS,
 										refusedContent: output.content ? structuredClone(output.content) : undefined,
+										demotedReasoningBlocks,
 									};
+								}
+								if (stopDetails?.type === "refusal" && demotedReasoningBlocks > 0) {
+									output.demotedReasoningBlocks = demotedReasoningBlocks;
 								}
 								if (!output.errorMessage) {
 									// Anthropic flagged an error-class stop (refusal / sensitive) without
@@ -5064,6 +5077,8 @@ type AnthropicResponseReplay = (message: AssistantMessage) => MessageParam | und
 type AnthropicBuiltParams = {
 	params: MessageCreateParamsStreaming;
 	requestControls: AnthropicRequestControls | undefined;
+	/** Other models' reasoning blocks the history replays as text, reported on a refusal. */
+	demotedReasoningBlocks: number;
 	replayResponse: AnthropicResponseReplay;
 };
 
@@ -5263,12 +5278,19 @@ function buildParams(
 		tools = [];
 	}
 
-	// Pre-compute metadata.
-	const metadataAccountId = readAnthropicMetadataAccountId(options?.metadata);
+	// Pre-compute metadata. For a first-party Anthropic OAuth request the serving
+	// credential owns the device identity: a caller resolves metadata once per
+	// model call, so a rotation inside one stream would otherwise pair the new
+	// account's bearer with the previous account's `account_uuid`/`device_id`.
+	const servingAccountId = model.provider === "anthropic" ? options?.oauthIdentity?.accountId : undefined;
+	const metadataAccountId = readAnthropicMetadataAccountId(options?.metadata) ?? servingAccountId;
 	const metadataUserId = resolveAnthropicMetadataUserId(
-		readAnthropicMetadataString(options?.metadata, "user_id") ??
-			// Deliberately share the normalized affinity identity across Kimi's two transports.
-			(model.provider === "kimi-code" ? getOpenAIPromptCacheKey(options) : undefined),
+		rebindAnthropicMetadataUserId(
+			readAnthropicMetadataString(options?.metadata, "user_id") ??
+				// Deliberately share the normalized affinity identity across Kimi's two transports.
+				(model.provider === "kimi-code" ? getOpenAIPromptCacheKey(options) : undefined),
+			isOAuthToken ? servingAccountId : undefined,
+		),
 		isOAuthToken,
 		options?.sessionId,
 		metadataAccountId,
@@ -5447,10 +5469,11 @@ function buildParams(
 		dropAllThinking: dropAllThinking || stripThinkingHistory,
 		thinkingEnabled: thinking?.type === "adaptive" || thinking?.type === "enabled",
 		droppedThinkingBlocks,
+		omitDemotedReasoning: options?.omitDemotedReasoning,
 		credentialId: options?.credentialId,
 		compactionRequest,
 	};
-	const wireMessages = convertAnthropicMessages(
+	const { messages: wireMessages, demotedReasoningBlocks } = encodeAnthropicMessages(
 		insertAnthropicControlMarkers(context.messages, [...toolPlan.inserts, ...effortPlan.inserts]),
 		effectiveModel,
 		isOAuthToken,
@@ -5597,6 +5620,7 @@ function buildParams(
 	return {
 		params,
 		requestControls,
+		demotedReasoningBlocks,
 		replayResponse: message =>
 			convertAnthropicMessages([message], effectiveModel, isOAuthToken, conversion).find(
 				param => param.role === "assistant",
@@ -5782,13 +5806,14 @@ function collapseFallbackSegments(content: AssistantMessage["content"]): Assista
 }
 
 /** History serialization choices {@link convertAnthropicMessages} applies to a request. */
-type AnthropicConversionOptions = {
+export type AnthropicConversionOptions = {
 	serverSideFallbackEnabled?: boolean;
 	replayCompaction?: boolean;
 	replayLegacyCompaction?: boolean;
 	dropAllThinking?: boolean;
 	thinkingEnabled?: boolean;
 	droppedThinkingBlocks?: ReadonlySet<string>;
+	omitDemotedReasoning?: boolean;
 	credentialId?: number;
 	/** On-demand compaction request: it ends inside the conversation, so it gets nothing live requests lack there. */
 	compactionRequest?: AnthropicCompactionRequest;
@@ -5814,6 +5839,10 @@ type AnthropicConversionOptions = {
  * `opts.thinkingEnabled` — the CURRENT request enables thinking. Combined with
  * `model.compat.requiresThinkingPresence` this pads assistant turns that carry
  * no thinking block at all (see the guard below).
+ *
+ * `opts.omitDemotedReasoning` — leave out other models' reasoning that would
+ * replay as text. Unsigned blocks beside signed thinking in one turn are the
+ * turn's own and keep their text replay.
  */
 export function convertAnthropicMessages(
 	messages: Message[],
@@ -5821,6 +5850,17 @@ export function convertAnthropicMessages(
 	isOAuthToken: boolean,
 	opts?: AnthropicConversionOptions,
 ): AnthropicMessageParam[] {
+	return encodeAnthropicMessages(messages, model, isOAuthToken, opts).messages;
+}
+
+/** {@link convertAnthropicMessages}, also counting the other models' reasoning blocks it replayed as text. */
+function encodeAnthropicMessages(
+	messages: Message[],
+	model: Model<"anthropic-messages">,
+	isOAuthToken: boolean,
+	opts?: AnthropicConversionOptions,
+): { messages: AnthropicMessageParam[]; demotedReasoningBlocks: number } {
+	let demotedReasoningBlocks = 0;
 	// Indices of params emitted from agent-owned `developer` messages. After the
 	// main pass, the ones whose placement satisfies Anthropic's mid-conversation
 	// rules are upgraded from the `user` role to the authoritative `system` role.
@@ -6047,6 +6087,10 @@ export function convertAnthropicMessages(
 			for (const block of content) {
 				if (block.type === "text") {
 					if (block.text.trim().length === 0) continue;
+					if (isDemotedThinking(block)) {
+						if (opts?.omitDemotedReasoning) continue;
+						demotedReasoningBlocks++;
+					}
 					blocks.push({
 						type: "text",
 						text: block.text.toWellFormed(),
@@ -6082,7 +6126,8 @@ export function convertAnthropicMessages(
 								thinking: block.thinking.toWellFormed(),
 								signature: "",
 							});
-						} else {
+						} else if (!opts?.omitDemotedReasoning) {
+							demotedReasoningBlocks++;
 							blocks.push({
 								type: "text",
 								text: renderDemotedThinking(model.id, block.thinking),
@@ -6354,13 +6399,13 @@ export function convertAnthropicMessages(
 		params.splice(i, 1);
 		i--;
 	}
-	if (opts?.compactionRequest) return params;
+	if (opts?.compactionRequest) return { messages: params, demotedReasoningBlocks };
 	const last = skipControls(params.length, -1);
 	if (params[last]?.role === "assistant") {
 		params.splice(last + 1, 0, { role: "user", content: "Continue." });
 	}
 
-	return params;
+	return { messages: params, demotedReasoningBlocks };
 }
 
 /**

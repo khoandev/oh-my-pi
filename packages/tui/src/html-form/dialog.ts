@@ -8,8 +8,9 @@
  * ({@link paginate}) at section boundaries where possible; focus drives the
  * visible page, so moving past a page's last control turns the page. A native
  * (Tern) terminal gets the form described semantically instead: one tab per
- * question (a top-level `<fieldset>`; context before it rides along) plus a
- * Review tab, the tab's content in a column the terminal scrolls, and an
+ * question (a top-level `<fieldset>`, or a field of loose content between
+ * fieldsets; context before it rides along) plus a Review tab, the tab's
+ * content in a column the terminal scrolls, and an
  * action bar that stays in view below it, with Submit on the last question
  * tab and on Review. Clicks come back through
  * {@link HtmlFormDialog.handleNativeEvent}.
@@ -29,7 +30,9 @@
  * 	onCancel: () => resolve(undefined),
  * });
  */
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { formatKeyHint } from "../app-keybindings";
+import { BracketedPasteHandler } from "../bracketed-paste";
 import { editorKey, editorKeys } from "../chrome/keybinding-hints";
 import { OverlayPanel, PanelDivider, PanelRows } from "../chrome/overlay-box";
 import { SvgFigure } from "../chat/svg-figure";
@@ -46,6 +49,7 @@ import {
 } from "../keybinding-matchers";
 import { getKeybindings } from "../keybindings";
 import { extractPrintableText, type KeyId, matchesKey } from "../keys";
+import { isSvgMedia, loadMedia, type Media, svgMedia } from "../media";
 import { code, col, item, keyed, list, node, row, span, text } from "../native/describe";
 import { nativeImageNode } from "../native/blobs";
 import {
@@ -59,6 +63,9 @@ import {
 import { actionBar, actionButton, itemIndex } from "../native/overlay";
 import { isNativeRendering } from "../native/state";
 import type { AskDialogInputGuard } from "../overlays/ask-dialog";
+import { compactImageAttachments, formatVisionMarker, PLACEHOLDER_REGEX } from "../prompt/composer-attachments";
+import { classifyImagePaste } from "../prompt/custom-editor";
+import { OrderedPastes } from "../prompt/ordered-pastes";
 import { wrapPrefixedLine } from "../render/hanging-wrap";
 import { getEditorTheme, type ThemeColor, theme } from "../theme/theme";
 import { optionMarker } from "../tools/ask";
@@ -75,7 +82,6 @@ import {
 	OTHER_LABEL,
 	textValue,
 } from "./data";
-import { type FormMedia, isSvgMedia, loadFormImage, svgMedia } from "./media";
 import { BreakRank, type Page, type PageAtom, pageHeight, paginate } from "./paginate";
 import {
 	type ChoiceField,
@@ -109,6 +115,16 @@ export interface HtmlFormDialogOptions {
 	inputGuard?: AskDialogInputGuard;
 	/** Directory relative `<img src>` paths resolve against; the process's when omitted. */
 	cwd?: string;
+	/** Lets the open option note take pasted images; see {@link HtmlFormDialog.attachImage}. */
+	acceptImages?: boolean;
+	/**
+	 * Called for an empty bracketed paste into an open note. Like HookEditor's, the host reserves with
+	 * {@link HtmlFormDialog.beginPaste} synchronously, before its first await, and its
+	 * {@link HtmlFormDialog.attachImage} returns the marker that reserved paste delivers.
+	 */
+	onPasteImage?(): Promise<boolean> | void;
+	/** Called once per file path when a bracketed paste into an open note is only image paths. */
+	onPasteImagePath?(path: string): void | Promise<void>;
 	onSubmit(data: HtmlFormData, notes: OptionNote[]): void;
 	onCancel(): void;
 }
@@ -171,11 +187,35 @@ interface Layout {
 	pictures: Map<PageAtom, Component>;
 }
 
-/** A native question tab: indices of the sections it shows, and the fields in them. */
+/** Blocks `start` up to `end` (exclusive) of one form section. */
+interface TabPart {
+	section: number;
+	start: number;
+	end: number;
+}
+
+/** A native question tab: the section parts it shows, and the fields in them. */
 interface FormTab {
 	label: string;
-	sections: number[];
+	parts: TabPart[];
 	fields: FormField[];
+}
+
+/** A note saved on an option: its text, and the images its `[Image #N]` markers index. */
+interface SavedNote {
+	text: string;
+	images: ImageContent[];
+}
+
+/** The note being edited; dropped when it closes, so nothing of it outlives the note. */
+interface OpenNote {
+	field: ChoiceField;
+	option: number;
+	editor: Editor;
+	/** Saved images of the option plus those pasted since the note opened. */
+	images: ImageContent[];
+	pastes: OrderedPastes;
+	pasteHandler: BracketedPasteHandler;
 }
 
 /** Strip control bytes a model could smuggle into labels (escape sequences, `\r`); keep `\n`. */
@@ -233,33 +273,66 @@ function nativeSpans(spans: readonly FormSpan[], extra?: string): TspSpan[] {
 	});
 }
 
+/** Whether the keyboard can reach `field`: a text field, or a choice with an enabled option or an Other answer. */
+function reachable(field: FormField): boolean {
+	return field.kind === "text" || field.other || field.options.some(option => !option.disabled);
+}
+
 /**
  * Native question tabs: one per section holding fields, labeled by its legend
  * (else its first field's question). Sections of context alone join the next
- * tab, or the last one when nothing follows.
+ * tab, or the last one when nothing follows. In a form with two or more such
+ * tabs, loose content between fieldsets gets one tab per field, each with the
+ * context before it, so a question outside a `<fieldset>` does not share the
+ * tab of the question before it.
  */
 function buildTabs(form: HtmlForm, questions: ReadonlyMap<FormField, string>): FormTab[] {
+	const tabbed = form.sections.filter(section => section.blocks.some(block => block.kind === "field")).length > 1;
 	const tabs: FormTab[] = [];
-	let lead: number[] = [];
+	let lead: TabPart[] = [];
 	form.sections.forEach((section, index) => {
-		const fields = section.blocks.flatMap(block => (block.kind === "field" ? [block.field] : []));
-		if (fields.length === 0) {
-			lead.push(index);
+		const end = section.blocks.length;
+		if (!section.blocks.some(block => block.kind === "field")) {
+			lead.push({ section: index, start: 0, end });
 			return;
 		}
 		const title = sanitize(spansText(section.title)).replace(/\s+/g, " ").trim();
-		const label = title || sanitize(questions.get(fields[0]!) ?? "") || `Question ${tabs.length + 1}`;
-		tabs.push({
-			label: truncateToWidth(label, TAB_LABEL_WIDTH, Ellipsis.Unicode),
-			sections: [...lead, index],
-			fields,
-		});
-		lead = [];
+		// Where each tab of this section ends: after each loose field, the last one at the section's end.
+		// A group's tab also keeps the text between its options, unless its options straddle the next
+		// field: then that field keeps the context before it. A field the keyboard cannot reach (only
+		// disabled options) gets no tab of its own: it joins the next one.
+		const fieldBlocks = section.blocks.flatMap((block, at) =>
+			block.kind === "field" ? [{ at, through: Math.max(at + 1, block.optionsEnd ?? 0), field: block.field }] : [],
+		);
+		const cuts =
+			tabbed && !section.fieldset
+				? fieldBlocks.flatMap(({ at, through, field }, nth) => {
+						if (!reachable(field)) return [];
+						return [through <= (fieldBlocks[nth + 1]?.at ?? end) ? through : at + 1];
+					})
+				: [];
+		if (cuts.length === 0) cuts.push(end);
+		else cuts[cuts.length - 1] = end;
+		let start = 0;
+		for (const cut of cuts) {
+			const fields = section.blocks
+				.slice(start, cut)
+				.flatMap(block => (block.kind === "field" ? [block.field] : []));
+			const question = questions.get(fields.find(reachable) ?? fields[0]!) ?? "";
+			const label = title || sanitize(question) || `Question ${tabs.length + 1}`;
+			tabs.push({
+				label: truncateToWidth(label, TAB_LABEL_WIDTH, Ellipsis.Unicode),
+				parts: [...lead, { section: index, start, end: cut }],
+				fields,
+			});
+			lead = [];
+			start = cut;
+		}
 	});
 	if (lead.length > 0) {
 		const last = tabs.at(-1);
-		if (last) last.sections.push(...lead);
-		else tabs.push({ label: "", sections: lead, fields: [] });
+		if (last) last.parts.push(...lead);
+		else tabs.push({ label: "", parts: lead, fields: [] });
 	}
 	return tabs;
 }
@@ -272,8 +345,8 @@ export class HtmlFormDialog implements Component, Focusable {
 	readonly #fieldIndex = new Map<FormField, number>();
 	readonly #checked = new Map<ChoiceField, Set<number>>();
 	readonly #inputs = new Map<TextField, Input>();
-	readonly #notes = new Map<ChoiceField, Map<number, string>>();
-	#noteEditor: { field: ChoiceField; option: number; editor: Editor } | undefined;
+	readonly #notes = new Map<ChoiceField, Map<number, SavedNote>>();
+	#noteEditor: OpenNote | undefined;
 	#savedNoteEditor: Editor | undefined;
 	#useTerminalCursor = false;
 	/** The Other answer's text of each group that offers one. */
@@ -405,14 +478,17 @@ export class HtmlFormDialog implements Component, Focusable {
 			this.#otherChosen(field);
 			const checked = this.#checked.get(field)!;
 			field.options.forEach((option, index) => {
-				const text = notes.get(index)?.trim();
+				const saved = notes.get(index);
+				const text = saved?.text.trim();
 				if (!text || option.disabled || !checked.has(index)) return;
+				const images = saved?.images;
 				selected.push({
 					name: field.name,
 					question: this.#questions.get(field) ?? field.name,
 					option: optionText(option) || option.value,
 					value: option.value,
 					text,
+					...(images?.length ? { images: [...images] } : {}),
 				});
 			});
 		}
@@ -439,7 +515,12 @@ export class HtmlFormDialog implements Component, Focusable {
 			remaining: this.#remaining ?? null,
 			errors: Object.fromEntries([...this.#errors].map(([field, error]) => [field.name, error])),
 			data: this.data(),
-			notes: Object.fromEntries([...this.#notes].map(([field, notes]) => [field.name, Object.fromEntries(notes)])),
+			notes: Object.fromEntries(
+				[...this.#notes].map(([field, notes]) => [
+					field.name,
+					Object.fromEntries([...notes].map(([option, note]) => [option, note.text])),
+				]),
+			),
 			noteEdit: this.#noteEditor
 				? `${this.#noteEditor.field.name}=${this.#noteEditor.field.options[this.#noteEditor.option]!.value}`
 				: undefined,
@@ -466,7 +547,7 @@ export class HtmlFormDialog implements Component, Focusable {
 			return;
 		}
 		if (this.#guardBlocks()) {
-			if (matchesSelectUp(data) || matchesSelectDown(data)) this.#guardReleased = true;
+			if (matchesSelectUp(data) || matchesSelectDown(data)) this.#releaseGuard();
 			else this.#options.inputGuard?.handleInput(data);
 			return;
 		}
@@ -543,7 +624,7 @@ export class HtmlFormDialog implements Component, Focusable {
 		this.#resetCountdown();
 		this.#changed();
 		if (this.#noteEditor && !(event.type === "action" && (event.act === "hide" || event.act === "show"))) {
-			if (event.type === "action" && event.act === "save-note") this.#saveNote();
+			if (event.type === "action" && event.act === "save-note") this.#requestSave();
 			else if (event.type === "action" && event.act === "cancel") this.#closeNote();
 			return;
 		}
@@ -551,17 +632,23 @@ export class HtmlFormDialog implements Component, Focusable {
 			if (event.act === "cancel") this.#cancel();
 			else if (event.act === "hide" || event.act === "show") this.#setHidden(event.act === "hide");
 			else if (this.#hidden) return;
-			else if (event.act === "submit") this.#submit();
-			else if (event.act === "next") this.#showTab(this.#tab + 1);
-			else if (event.act === "note") this.#noteFromPointer(event.key);
-			else if (event.act.startsWith(EDIT_ACT)) {
-				const field = this.#form.fields[Number(event.act.slice(EDIT_ACT.length))];
-				const stop = this.#stops.findIndex(candidate => candidate.kind === "text" && candidate.field === field);
-				if (stop !== -1) this.#setFocus(stop);
+			else {
+				// A pointer action on the dialog is an explicit hand-off from the draft.
+				this.#releaseGuardForPointer();
+				if (event.act === "submit") this.#submit();
+				else if (event.act === "next") this.#showTab(this.#tab + 1);
+				else if (event.act === "note") this.#noteFromPointer(event.key);
+				else if (event.act.startsWith(EDIT_ACT)) {
+					const field = this.#form.fields[Number(event.act.slice(EDIT_ACT.length))];
+					const stop = this.#stops.findIndex(candidate => candidate.kind === "text" && candidate.field === field);
+					if (stop !== -1) this.#setFocus(stop);
+				}
 			}
 			return;
 		}
 		if (this.#hidden || (event.type !== "select" && event.type !== "activate")) return;
+		// A click on a row (the Other one especially) takes the keys the same way up/down do.
+		this.#releaseGuardForPointer();
 		const leaf = leafKey(event.key);
 		if (leaf === "tabs") {
 			const index = event.item === REVIEW_ID ? this.#tabs.length : itemIndex(event.item, "t");
@@ -635,6 +722,8 @@ export class HtmlFormDialog implements Component, Focusable {
 	}
 
 	dispose(): void {
+		this.#noteEditor?.pastes.clear();
+		this.#noteEditor = undefined;
 		this.#stopCountdown();
 		if (this.#savedNoteEditor) this.#savedNoteEditor.focused = false;
 		this.#mediaAbort.abort();
@@ -657,7 +746,7 @@ export class HtmlFormDialog implements Component, Focusable {
 		}
 		this.#media.set(block, { state: "loading" });
 		const signal = this.#mediaAbort.signal;
-		loadFormImage(block.src, { cwd: this.#options.cwd ?? process.cwd(), signal }).then(
+		loadMedia(block.src, { cwd: this.#options.cwd ?? process.cwd(), signal }).then(
 			// A picture landing after dispose must not take an image key nobody will release.
 			media => signal.aborted || this.#settleMedia(block, this.#readyMedia(media, block.alt || "image")),
 			(error: unknown) => {
@@ -684,7 +773,7 @@ export class HtmlFormDialog implements Component, Focusable {
 	 * Both go through the TUI's image budget: without an id, a Kitty image is a self-contained
 	 * `a=T` placement that repainting the rows never removes, so it outlives the form.
 	 */
-	#readyMedia(media: FormMedia, alt: string): MediaSlot {
+	#readyMedia(media: Media, alt: string): MediaSlot {
 		const maxRows = this.#pictureRows();
 		const budget = this.#options.tui?.imageBudget;
 		const native = nativeImageNode(media.bytes, media.mime, { alt, max: { h: `${maxRows}lines` } });
@@ -910,6 +999,19 @@ export class HtmlFormDialog implements Component, Focusable {
 		return !this.#guardReleased && (this.#options.inputGuard?.isBlocked() ?? false);
 	}
 
+	/** Tells the guard right away, so its host stops owning the composer before the next render. */
+	#releaseGuard(): void {
+		this.#guardReleased = true;
+		this.#options.inputGuard?.syncPresentation?.(false);
+	}
+
+	/** A pointer pick or action on the form is the user handing the keys over, as up/down does. */
+	#releaseGuardForPointer(): void {
+		if (!this.#guardBlocks()) return;
+		this.#releaseGuard();
+		this.#changed();
+	}
+
 	#guardHint(guard: AskDialogInputGuard): string {
 		return `${editorKeys("tui.select.up", "tui.select.down")} answer · ${guard.hint}`;
 	}
@@ -922,14 +1024,31 @@ export class HtmlFormDialog implements Component, Focusable {
 		const option =
 			target ?? (stop.kind === "option" ? stop.option : (this.#open?.highlight ?? this.#current(stop.field)));
 		if (option === undefined || stop.field.options[option]?.disabled !== false) return;
+		// Opening a note hands the keys over, as up/down does, so a draft that refills later can't claim pastes.
+		this.#releaseGuard();
 		const editor = (this.#savedNoteEditor ??= new Editor(getEditorTheme()));
 		editor.setBorderVisible(false);
 		editor.setMaxHeight(4);
 		editor.disableSubmit = true;
 		editor.setUseTerminalCursor(this.#useTerminalCursor);
 		editor.onChange = () => this.#resetCountdown();
-		editor.setText(this.#notes.get(stop.field)?.get(option) ?? "", { cursor: "start" });
-		this.#noteEditor = { field: stop.field, option, editor };
+		const saved = this.#notes.get(stop.field)?.get(option);
+		editor.setText(saved?.text ?? "", { cursor: "start" });
+		if (this.#options.acceptImages) editor.atomicTokenPattern = PLACEHOLDER_REGEX;
+		const note: OpenNote = {
+			field: stop.field,
+			option,
+			editor,
+			images: [...(saved?.images ?? [])],
+			pasteHandler: new BracketedPasteHandler(),
+			pastes: new OrderedPastes({
+				deliver: text => editor.pasteText(text),
+				run: () => this.#saveNote(),
+				live: () => this.#noteEditor === note,
+				afterSettle: () => this.#changed(),
+			}),
+		};
+		this.#noteEditor = note;
 		this.#syncControlFocus();
 	}
 
@@ -960,27 +1079,94 @@ export class HtmlFormDialog implements Component, Focusable {
 	}
 
 	#noteEditorInput(data: string): void {
+		const note = this.#noteEditor!;
+		if (this.#options.acceptImages) {
+			const paste = note.pasteHandler.process(data);
+			if (paste.handled) {
+				if (paste.pasteContent !== undefined) this.#notePaste(note, paste.pasteContent);
+				if (paste.remaining.length > 0) this.handleInput(paste.remaining);
+				return;
+			}
+		}
 		if (matchesSelectCancel(data)) this.#closeNote();
-		else if (getKeybindings().matches(data, "tui.input.submit")) this.#saveNote();
-		else this.#noteEditor!.editor.handleInput(data);
+		else if (getKeybindings().matches(data, "tui.input.submit")) this.#requestSave();
+		else note.editor.handleInput(data);
+	}
+
+	#notePaste(note: OpenNote, content: string): void {
+		const { onPasteImage, onPasteImagePath } = this.#options;
+		const image = classifyImagePaste(content);
+		if (image.kind === "clipboard" && onPasteImage) {
+			void onPasteImage();
+			return;
+		}
+		if (image.kind === "paths" && onPasteImagePath) {
+			for (const path of image.paths) void onPasteImagePath(path);
+			return;
+		}
+		note.pastes.paste(content);
+	}
+
+	#requestSave(): void {
+		if (!this.#noteEditor!.pastes.holdAction()) this.#saveNote();
 	}
 
 	#saveNote(): void {
-		const active = this.#noteEditor!;
-		const note = active.editor.getExpandedText().trim();
-		const notes = this.#notes.get(active.field)!;
-		if (note) notes.set(active.option, note);
-		else notes.delete(active.option);
+		const note = this.#noteEditor!;
+		const { text, images } = compactImageAttachments(note.editor.getExpandedText().trim(), note.images);
+		const notes = this.#notes.get(note.field)!;
+		if (text) notes.set(note.option, { text, images });
+		else notes.delete(note.option);
 		this.#closeNote();
 	}
 
 	#closeNote(): void {
-		// The editor is reused: a later note's literal `[Paste #1]` must not expand to this one's paste.
-		this.#noteEditor?.editor.clearPasteState();
-		this.#noteEditor?.editor.setText("");
+		const note = this.#noteEditor;
+		if (note) {
+			note.pastes.clear();
+			// The editor is reused: a later note's literal `[Paste #1]` must not expand to this one's paste.
+			note.editor.clearPasteState();
+			note.editor.setText("");
+		}
 		this.#noteEditor = undefined;
 		this.#syncControlFocus();
 		this.#changed();
+	}
+
+	// ── Pasted images ────────────────────────────────────────────────────────
+
+	/** Whether the form takes a new image paste now: a note is open and the form is shown. */
+	get acceptsImages(): boolean {
+		return !!this.#options.acceptImages && this.#noteEditor !== undefined && !this.#hidden;
+	}
+
+	/**
+	 * Defined only while {@link acceptsImages}. A host routes Ctrl+V and pastes to any focused component that
+	 * has `pasteText`, so with no note open the form must behave as a plain dialog.
+	 */
+	get pasteText(): ((text: string) => void) | undefined {
+		return this.acceptsImages ? text => this.#pasteText(text) : undefined;
+	}
+
+	/**
+	 * Adds an image to the open note; returns its `[Image #N, WxH]` marker for the caller to deliver.
+	 * Takes it while the form is hidden too: a paste reserved before Alt+H still lands in its note.
+	 */
+	attachImage(image: ImageContent, dims?: { width: number; height: number }): string | undefined {
+		const note = this.#options.acceptImages ? this.#noteEditor : undefined;
+		if (!note) return undefined;
+		note.images.push(image);
+		return formatVisionMarker("image", note.images.length, dims);
+	}
+
+	/** Ordered delivery into the open note; refuses when {@link acceptsImages} is false. */
+	beginPaste(): (text: string | undefined) => boolean {
+		return this.acceptsImages ? this.#noteEditor!.pastes.begin() : () => false;
+	}
+
+	#pasteText(text: string): void {
+		const note = this.#noteEditor;
+		if (note && text) this.#notePaste(note, text);
 	}
 
 	#noteFromPointer(key: string): void {
@@ -1210,6 +1396,8 @@ export class HtmlFormDialog implements Component, Focusable {
 	#setHidden(hidden: boolean): void {
 		if (this.#hidden === hidden) return;
 		this.#hidden = hidden;
+		// A hidden form takes no new paste (see acceptsImages), but one already reserved still lands
+		// in its note, and an Enter held behind it still saves.
 		this.#open = undefined;
 		this.#syncControlFocus();
 	}
@@ -1712,7 +1900,7 @@ export class HtmlFormDialog implements Component, Focusable {
 		if (review) {
 			children.push(...this.#describeReview());
 		} else {
-			const form = col(this.#describeSections(this.#tabs[this.#tab]?.sections ?? []), {
+			const form = col(this.#describeParts(this.#tabs[this.#tab]?.parts ?? []), {
 				gap: "lg",
 				role: "omp.ask.form",
 			});
@@ -1754,13 +1942,14 @@ export class HtmlFormDialog implements Component, Focusable {
 		return keyed(row([tabs], { role: "omp.ask.head", align: "center" }), "head");
 	}
 
-	#describeSections(sections: readonly number[]): NativeChild[] {
-		return sections.map(index => {
+	#describeParts(parts: readonly TabPart[]): NativeChild[] {
+		return parts.map(({ section: index, start, end }) => {
 			const section = this.#form.sections[index]!;
-			const blocks = section.blocks.map(block => this.#describeBlock(block));
+			const blocks = section.blocks.slice(start, end).map(block => this.#describeBlock(block));
+			const key = start === 0 ? `s${index}` : `s${index}.${start}`;
 			return section.title.length > 0
-				? node("section", { head: nativeSpans(section.title), role: "omp.ask.section" }, blocks, `s${index}`)
-				: keyed(col(blocks, { gap: "md", role: "omp.ask.section" }), `s${index}`);
+				? node("section", { head: nativeSpans(section.title), role: "omp.ask.section" }, blocks, key)
+				: keyed(col(blocks, { gap: "md", role: "omp.ask.section" }), key);
 		});
 	}
 
@@ -1942,7 +2131,7 @@ export class HtmlFormDialog implements Component, Focusable {
 			const role = field.multi ? "omp.ask.check" : "omp.ask.option";
 			const items = field.options.map((option, optionIndex) => {
 				const isChecked = checked.has(optionIndex);
-				const note = this.#notes.get(field)?.get(optionIndex);
+				const note = this.#notes.get(field)?.get(optionIndex)?.text;
 				return item(`o${optionIndex}`, {
 					label: nativeSpans(option.label),
 					role,

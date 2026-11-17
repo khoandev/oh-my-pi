@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Input } from "@oh-my-pi/pi-tui/components/input";
 import { Editor } from "@oh-my-pi/pi-tui/components/editor";
-import { loadFormImage } from "@oh-my-pi/pi-tui/html-form/media";
+import { loadMedia } from "@oh-my-pi/pi-tui/media";
 import { getNativeBlob } from "@oh-my-pi/pi-tui/native/blobs";
 import { HtmlFormDialog } from "@oh-my-pi/pi-tui/html-form/dialog";
 import { BreakRank, type PageAtom, paginate } from "@oh-my-pi/pi-tui/html-form/paginate";
@@ -56,6 +56,13 @@ function findPath(root: NativeNode, predicate: (node: NativeNode) => boolean, pa
 		if (found) return found;
 	}
 	return undefined;
+}
+
+/** The text of every `text` node under `root`, in order. */
+function textsOf(root: NativeNode): string[] {
+	const spans = root.k === "text" && root.p && "spans" in root.p ? root.p.spans : undefined;
+	const own = spans ? [spans.map(item => item.t).join("")] : [];
+	return [...own, ...(root.c ?? []).flatMap(child => (isNode(child) ? textsOf(child) : []))];
 }
 
 const DB_FORM = `<form>
@@ -400,6 +407,181 @@ describe("html form", () => {
 		});
 	});
 
+	describe("option note images", () => {
+		const IMAGE = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
+		const DIMS = { width: 1, height: 1 };
+		const NOTE_KEY = "\x1bn";
+		const HOME = "\x1b[H";
+		const DELETE = "\x1b[3~";
+		const paste = (text: string) => `\x1b[200~${text}\x1b[201~`;
+
+		function addImage(form: HtmlFormDialog): string {
+			const settle = form.beginPaste();
+			const marker = form.attachImage(IMAGE, DIMS);
+			if (marker === undefined) throw new Error("note does not accept images");
+			settle(marker);
+			return marker;
+		}
+
+		function imageDialog(overrides: Partial<ConstructorParameters<typeof HtmlFormDialog>[1]> = {}) {
+			return dialog(DB_FORM, { acceptImages: true, ...overrides });
+		}
+
+		it("drops the image of a deleted marker and renumbers the rest", () => {
+			const { form } = imageDialog();
+			form.handleInput(NOTE_KEY);
+			addImage(form);
+			form.handleInput(" ");
+			const second = { ...IMAGE, data: "BBBB" };
+			form.beginPaste()(form.attachImage(second, DIMS));
+			form.handleInput(HOME);
+			form.handleInput(DELETE);
+			form.handleInput(ENTER);
+			expect(form.optionNotes()).toMatchObject([{ text: "[Image #1, 1x1]", images: [second] }]);
+
+			form.handleInput(NOTE_KEY);
+			expect(form.attachImage(IMAGE, DIMS)).toBe("[Image #2, 1x1]");
+		});
+
+		it("discards images added since the note opened when Esc closes it", () => {
+			const { form } = imageDialog();
+			form.handleInput(NOTE_KEY);
+			form.handleInput("kept");
+			form.handleInput(ENTER);
+			form.handleInput(NOTE_KEY);
+			addImage(form);
+			form.handleInput(ESC);
+			expect(form.optionNotes()).toMatchObject([{ text: "kept" }]);
+			expect(form.optionNotes()[0]?.images).toBeUndefined();
+			form.handleInput(NOTE_KEY);
+			expect(form.attachImage(IMAGE, DIMS)).toBe("[Image #1, 1x1]");
+		});
+
+		it("restores a saved note's images on reopening and numbers a new paste after them", () => {
+			const { form } = imageDialog();
+			form.handleInput(NOTE_KEY);
+			addImage(form);
+			form.handleInput(ENTER);
+			form.handleInput(NOTE_KEY);
+			const second = { ...IMAGE, data: "BBBB" };
+			expect(form.attachImage(second, DIMS)).toBe("[Image #2, 1x1]");
+			form.beginPaste()("[Image #2, 1x1]");
+			form.handleInput(ENTER);
+			expect(form.optionNotes()).toMatchObject([
+				{ text: "[Image #1, 1x1][Image #2, 1x1]", images: [IMAGE, second] },
+			]);
+		});
+
+		it("accepts images only when opted in, a note is open and the form is shown", () => {
+			const plain = dialog(DB_FORM).form;
+			plain.handleInput(NOTE_KEY);
+			expect(plain.acceptsImages).toBe(false);
+			expect(plain.pasteText).toBeUndefined();
+			expect(plain.attachImage(IMAGE)).toBeUndefined();
+
+			const { form } = imageDialog();
+			expect(form.acceptsImages).toBe(false);
+			expect(form.pasteText).toBeUndefined();
+			form.handleInput(NOTE_KEY);
+			expect(form.acceptsImages).toBe(true);
+			expect(form.pasteText).toBeDefined();
+			form.handleNativeEvent({ type: "action", key: "", act: "hide", mods: [] });
+			expect(form.acceptsImages).toBe(false);
+			expect(form.pasteText).toBeUndefined();
+			form.handleNativeEvent({ type: "action", key: "", act: "show", mods: [] });
+			expect(form.acceptsImages).toBe(true);
+			expect(form.pasteText).toBeDefined();
+			form.dispose();
+			expect(form.acceptsImages).toBe(false);
+			expect(form.pasteText).toBeUndefined();
+		});
+
+		it.each([
+			{ name: "saves once the paste settles with its marker", settleWith: "[Image #1, 1x1]", delivered: true },
+			{ name: "keeps the note open when the paste fails", settleWith: undefined, delivered: false },
+		])("Enter during a pending paste: $name", ({ settleWith, delivered }) => {
+			const { form } = imageDialog();
+			form.handleInput(NOTE_KEY);
+			form.handleInput("text ");
+			form.attachImage(IMAGE, DIMS);
+			const settle = form.beginPaste();
+			form.handleInput(ENTER);
+			expect(form.debugState().noteEdit).toBe("db=sqlite");
+			expect(form.optionNotes()).toEqual([]);
+
+			expect(settle(settleWith)).toBe(delivered);
+			if (delivered) {
+				expect(form.debugState().noteEdit).toBeUndefined();
+				expect(form.optionNotes()).toMatchObject([{ text: "text [Image #1, 1x1]", images: [IMAGE] }]);
+			} else {
+				expect(form.debugState().noteEdit).toBe("db=sqlite");
+				form.handleInput(ENTER);
+				expect(form.optionNotes()).toMatchObject([{ text: "text" }]);
+			}
+		});
+
+		it("sends an empty bracketed paste to onPasteImage and image-path pastes to onPasteImagePath", () => {
+			const onPasteImage = vi.fn();
+			const onPasteImagePath = vi.fn();
+			const { form } = imageDialog({ onPasteImage, onPasteImagePath });
+			form.handleInput(NOTE_KEY);
+			form.handleInput(paste(""));
+			expect(onPasteImage).toHaveBeenCalledTimes(1);
+			form.handleInput(paste("/tmp/a.png /tmp/b.png"));
+			expect(onPasteImagePath.mock.calls).toEqual([["/tmp/a.png"], ["/tmp/b.png"]]);
+			form.handleInput(paste("plain words"));
+			form.handleInput(ENTER);
+			expect(onPasteImage).toHaveBeenCalledTimes(1);
+			expect(onPasteImagePath).toHaveBeenCalledTimes(2);
+			expect(form.optionNotes()).toMatchObject([{ text: "plain words" }]);
+		});
+
+		it("leaves bracketed pastes alone without acceptImages", () => {
+			const onPasteImage = vi.fn();
+			const { form } = dialog(DB_FORM, { onPasteImage });
+			form.handleInput(NOTE_KEY);
+			form.handleInput(paste(""));
+			form.handleInput(paste("/tmp/a.png"));
+			form.handleInput(ENTER);
+			expect(onPasteImage).not.toHaveBeenCalled();
+			expect(form.optionNotes()).toMatchObject([{ text: "/tmp/a.png" }]);
+		});
+
+		it("lands a paste reserved before hiding, and the Enter held behind it still saves", () => {
+			const { form } = imageDialog();
+			form.handleInput(NOTE_KEY);
+			form.handleInput("kept ");
+			const settle = form.beginPaste();
+			form.handleInput(ENTER);
+			form.handleNativeEvent({ type: "action", key: "", act: "hide", mods: [] });
+			expect(form.beginPaste()("refused")).toBe(false);
+			const marker = form.attachImage(IMAGE, DIMS);
+			expect(settle(marker)).toBe(true);
+			expect(form.debugState().noteEdit).toBeUndefined();
+			expect(form.optionNotes()).toMatchObject([{ text: "kept [Image #1, 1x1]", images: [IMAGE] }]);
+		});
+
+		it("opening a note hands the keys over, so a draft that refills afterwards does not own input", () => {
+			let draft = "";
+			const presented: boolean[] = [];
+			const { form } = imageDialog({
+				inputGuard: {
+					isBlocked: () => draft.length > 0,
+					handleInput: vi.fn(),
+					hint: "typing edits your prompt",
+					syncPresentation: (blocked: boolean) => presented.push(blocked),
+				},
+			});
+			form.handleInput(NOTE_KEY);
+			draft = "late composer paste";
+			form.describe(CX);
+			expect(presented.at(-1)).toBe(false);
+			form.handleInput("x");
+			form.handleInput(ENTER);
+			expect(form.optionNotes()).toMatchObject([{ text: "x" }]);
+		});
+	});
+
 	describe("parsing", () => {
 		it("joins radios split across a decision table into one field labeled by column headers", () => {
 			const form = parseHtmlForm(`<form><table>
@@ -496,17 +678,17 @@ describe("html form", () => {
 			try {
 				await Bun.write(path.join(dir, "dot.png"), Uint8Array.fromBase64(PNG_1PX));
 				await Bun.write(path.join(dir, "notes.txt"), "not a picture");
-				expect((await loadFormImage("dot.png", { cwd: dir })).mime).toBe("image/png");
-				expect((await loadFormImage(`data:image/png;base64,${PNG_1PX}`, { cwd: dir })).mime).toBe("image/png");
-				const svg = await loadFormImage("data:image/svg+xml;utf8,%3Csvg viewBox='0 0 4 2'%3E%3C/svg%3E", {
+				expect((await loadMedia("dot.png", { cwd: dir })).mime).toBe("image/png");
+				expect((await loadMedia(`data:image/png;base64,${PNG_1PX}`, { cwd: dir })).mime).toBe("image/png");
+				const svg = await loadMedia("data:image/svg+xml;utf8,%3Csvg viewBox='0 0 4 2'%3E%3C/svg%3E", {
 					cwd: dir,
 				});
 				// An svg sized only by its viewBox gets the size and namespace a standalone drawing needs.
 				expect(new TextDecoder().decode(svg.bytes)).toStartWith(
 					`<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"`,
 				);
-				await expect(loadFormImage("notes.txt", { cwd: dir })).rejects.toThrow("not a PNG");
-				await expect(loadFormImage("missing.png", { cwd: dir })).rejects.toThrow();
+				await expect(loadMedia("notes.txt", { cwd: dir })).rejects.toThrow("not a PNG");
+				await expect(loadMedia("missing.png", { cwd: dir })).rejects.toThrow();
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}
@@ -872,7 +1054,7 @@ describe("html form", () => {
 				const path = findPath(root, node => node.k === "tabs")!;
 				let tabs: NativeNode = root;
 				for (const key of path.split("/")) tabs = (tabs.c ?? []).filter(isNode).find(child => child.key === key)!;
-				const items = (tabs.p && "items" in tabs.p ? tabs.p.items : undefined) ?? [];
+				const items = (tabs.k === "tabs" ? tabs.p?.items : undefined) ?? [];
 				return items.flatMap(tab =>
 					"id" in tab && typeof tab.label !== "string" && tab.label[0]?.t === "✓ " ? [tab.id] : [],
 				);
@@ -907,6 +1089,97 @@ describe("html form", () => {
 			} finally {
 				setNativeRendering(false);
 			}
+		});
+
+		it("natively: each question after the fieldsets gets its own tab, with the context before it", () => {
+			const { form } = dialog(`<form>
+				<fieldset><legend>Length</legend><label><input type="radio" name="length" value="short" checked> Short</label><label><input type="radio" name="length" value="long"> Long</label></fieldset>
+				<fieldset><legend>Languages</legend><label><input type="checkbox" name="languages" value="ts"> TypeScript</label><label><input type="checkbox" name="languages" value="py"> Python</label></fieldset>
+				<label>Editor <select name="editor"><option value="vscode">VS Code</option><option value="zed">Zed</option></select></label>
+				<p>How urgent is it?</p>
+				<label>Priority <input type="number" name="priority" value="3"></label>
+			</form>`);
+			const root = form.describe(CX);
+			const tabs = findPath(root, node => node.k === "tabs")!;
+			let strip: NativeNode = root;
+			for (const key of tabs.split("/")) strip = (strip.c ?? []).filter(isNode).find(child => child.key === key)!;
+			const items = (strip.k === "tabs" ? strip.p?.items : undefined) ?? [];
+			expect(items.map(item => ("id" in item ? item.id : ""))).toEqual(["t0", "t1", "t2", "t3", "review"]);
+			form.handleNativeEvent({ type: "select", key: tabs, item: "t2" });
+			const editorTab = form.describe(CX);
+			expect(textsOf(editorTab)).toContain("Editor");
+			expect(textsOf(editorTab)).not.toContain("How urgent is it?");
+			// The Priority input's well, clickable while another field has focus.
+			expect(
+				findPath(editorTab, node => !!node.p && "actions" in node.p && node.p.actions?.click === "edit:3"),
+			).toBeUndefined();
+			form.handleNativeEvent({ type: "select", key: tabs, item: "t3" });
+			const priorityTab = textsOf(form.describe(CX));
+			expect(priorityTab).toEqual(expect.arrayContaining(["How urgent is it?", "Priority"]));
+			expect(priorityTab).not.toContain("Editor");
+		});
+
+		it("natively: text between a loose group's options stays on the group's tab", () => {
+			const { form } = dialog(`<form>
+				<fieldset><legend>Length</legend><label><input type="radio" name="length" value="short" checked> Short</label></fieldset>
+				<label><input type="radio" name="plan" value="basic" checked> Basic</label>
+				<p>Premium includes backups</p>
+				<label><input type="radio" name="plan" value="premium"> Premium</label>
+				<label>Notes <input name="notes"></label>
+			</form>`);
+			const tabs = findPath(form.describe(CX), node => node.k === "tabs")!;
+			form.handleNativeEvent({ type: "select", key: tabs, item: "t1" });
+			expect(textsOf(form.describe(CX))).toContain("Premium includes backups");
+			form.handleNativeEvent({ type: "select", key: tabs, item: "t2" });
+			expect(textsOf(form.describe(CX))).toEqual(expect.arrayContaining(["Notes"]));
+			expect(textsOf(form.describe(CX))).not.toContain("Premium includes backups");
+		});
+
+		it("natively: a field between a loose group's options keeps the context before it", () => {
+			const { form } = dialog(`<form>
+				<fieldset><legend>Length</legend><label><input type="radio" name="length" value="short" checked> Short</label></fieldset>
+				<label><input type="radio" name="plan" value="basic" checked> Basic</label>
+				<p>Choose a compliant region</p>
+				<label>Region <select name="region"><option value="us">US</option><option value="eu">EU</option></select></label>
+				<label><input type="radio" name="plan" value="premium"> Premium</label>
+			</form>`);
+			const tabs = findPath(form.describe(CX), node => node.k === "tabs")!;
+			form.handleNativeEvent({ type: "select", key: tabs, item: "t1" });
+			expect(textsOf(form.describe(CX))).not.toContain("Choose a compliant region");
+			form.handleNativeEvent({ type: "select", key: tabs, item: "t2" });
+			expect(textsOf(form.describe(CX))).toEqual(expect.arrayContaining(["Choose a compliant region", "Region"]));
+		});
+
+		it("natively: a loose field with only disabled options shares the next tab, so the focused field stays shown", () => {
+			const { form } = dialog(`<form>
+				<label><input type="checkbox" name="locked" disabled> Locked</label>
+				<label>Name <input name="name"></label>
+				<fieldset><legend>Length</legend><label><input type="radio" name="length" value="short" checked> Short</label></fieldset>
+			</form>`);
+			const root = form.describe(CX);
+			const path = findPath(root, node => node.k === "tabs")!;
+			let strip: NativeNode = root;
+			for (const key of path.split("/")) strip = (strip.c ?? []).filter(isNode).find(child => child.key === key)!;
+			const items = (strip.k === "tabs" ? strip.p?.items : undefined) ?? [];
+			expect(items.map(item => ("id" in item ? item.id : ""))).toEqual(["t0", "t1", "review"]);
+			// The shared tab is named after Name, the question the keyboard reaches.
+			const first = items[0];
+			expect(first && "label" in first && typeof first.label !== "string" ? first.label[0]?.t : "").toBe("Name");
+			// Focus opens on Name, the first control the keyboard reaches; the shown tab holds it.
+			expect(textsOf(root)).toContain("Name");
+		});
+
+		it("natively: a fieldset without a legend stays one tab", () => {
+			const { form } = dialog(`<form>
+				<fieldset><legend>Length</legend><label><input type="radio" name="length" value="short" checked> Short</label></fieldset>
+				<fieldset><label>Name <input name="name"></label><label>Email <input name="email"></label></fieldset>
+			</form>`);
+			const root = form.describe(CX);
+			const path = findPath(root, node => node.k === "tabs")!;
+			let strip: NativeNode = root;
+			for (const key of path.split("/")) strip = (strip.c ?? []).filter(isNode).find(child => child.key === key)!;
+			const items = (strip.k === "tabs" ? strip.p?.items : undefined) ?? [];
+			expect(items.map(item => ("id" in item ? item.id : ""))).toEqual(["t0", "t1", "review"]);
 		});
 
 		it("natively: the form sits in the card's shrinking, scrolling list and the action bar stays outside it", () => {
@@ -993,6 +1266,37 @@ describe("html form", () => {
 				len: 0,
 			});
 			expect(form.data()).toMatchObject({ db: "Fly Postgres HA" });
+		});
+
+		it("natively: clicking Other hands the keys over even while a composer draft owns typing", () => {
+			const typed: string[] = [];
+			const { form } = dialog(DB_FORM, {
+				inputGuard: {
+					isBlocked: () => true,
+					handleInput: (data: string) => typed.push(data),
+					hint: "typing edits your prompt",
+				},
+			});
+			const radios = findPath(form.describe(CX), node => node.k === "list" && node.key === "f0")!;
+			form.handleNativeEvent({ type: "select", key: radios, item: "other" });
+			for (const key of ["F", "l", "y"]) form.handleInput(key);
+			expect(form.data()).toMatchObject({ db: "Fly" });
+			expect(typed).toEqual([]);
+		});
+
+		it("natively: clicking a text well hands the keys over even while a composer draft owns typing", () => {
+			const typed: string[] = [];
+			const { form } = dialog(DB_FORM, {
+				inputGuard: {
+					isBlocked: () => true,
+					handleInput: (data: string) => typed.push(data),
+					hint: "typing edits your prompt",
+				},
+			});
+			form.handleNativeEvent({ type: "action", key: "x", act: "edit:3", mods: [] });
+			form.handleInput("5");
+			expect(form.data()).toMatchObject({ workers: 54 });
+			expect(typed).toEqual([]);
 		});
 
 		it("natively: keys act immediately even though rows were never rendered", () => {

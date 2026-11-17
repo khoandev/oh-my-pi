@@ -1,27 +1,48 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use atspi::{
-	CoordType, Layer, ObjectRefOwned, Role, State, StateSet, proxy::accessible::ObjectRefExt, zbus,
-	zbus::names::UniqueName,
+	CoordType, Layer, ObjectRefOwned, Role, State, StateSet,
+	proxy::{
+		accessible::{AccessibleProxy, ObjectRefExt},
+		bus::BusProxy,
+	},
+	zbus::{self, Connection, names::UniqueName, proxy::CacheProperties},
 };
 use tokio::runtime::{Builder, Runtime};
 
 use crate::desktop::{
-	ax::{AxBounds, AxHandle, AxProps, WalkBounds, normalize_role_atspi, text_readback},
+	ax::{AxBounds, AxHandle, AxProps, WalkBounds, masks, normalize_role_atspi, text_readback},
 	backend::AxBackend,
-	error::{CoreResult, DesktopError},
+	control::cancellable,
+	error::{CoreResult, DesktopError, ErrorCode},
 	types::DesktopWindow,
 };
 
+mod combo;
 mod menus;
 
+/// How long an application gets to answer before it counts as not answering:
+/// one request reads one element (about a dozen calls) or walks a short chain
+/// of its parents or children, and a read of a whole application or menu
+/// bounds each call instead. libatspi gives each call 800 ms; a text edit in
+/// an office suite can take 2 s.
+///
+/// at-spi2-core's ATK bridge (GTK 3 apps) replies to `DoAction` before it runs
+/// the action inside its D-Bus dispatch, so an action that opens a modal
+/// dialog leaves the app answering no request until that dialog closes.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most windows [`AtSpiAx::windows`] lists.
+const MAX_WINDOWS: usize = 48;
+
 pub struct AtSpiAx {
-	rt:         Runtime,
-	connection: atspi::AccessibilityConnection,
+	rt:            Runtime,
+	connection:    Connection,
+	/// [`REPLY_TIMEOUT`] outside tests.
+	reply_timeout: Duration,
 	/// The display server's own list of windows, where it knows where each one
 	/// is (X11).
-	native:     Option<Box<dyn NativeWindows>>,
-	frames:     FrameCache,
+	native:        Option<Box<dyn NativeWindows>>,
+	frames:        FrameCache,
 }
 
 /// A native top-level window's geometry as the display server reports it.
@@ -116,6 +137,50 @@ fn state_enabled(states: StateSet) -> bool {
 	states.contains(State::Enabled) || states.contains(State::Sensitive)
 }
 
+fn unanswered(who: &str, within: Duration) -> DesktopError {
+	DesktopError::timeout(format!(
+		"AT-SPI: {who} did not answer within {} s. An app answers no accessibility request while it \
+		 is busy, and a GTK 3 app none while a modal dialog that an accessibility action (press, \
+		 menu select) opened is up; use screenshots and pointer or key input until it answers again",
+		within.as_secs_f64()
+	))
+}
+
+/// The error for a lookup that missed what an application that did not answer
+/// [`AtSpiAx::windows`] holds.
+pub(crate) fn not_answering() -> DesktopError {
+	unanswered("the application", REPLY_TIMEOUT)
+}
+
+/// `error`, saying that an action or value the application did not confirm
+/// may still take effect.
+fn unconfirmed(mut error: DesktopError) -> DesktopError {
+	if error.code == ErrorCode::Timeout {
+		error
+			.message
+			.push_str(". What was sent to it may still take effect when it answers");
+	}
+	error
+}
+
+/// `future`, or [`unanswered`] once it has waited `within`.
+async fn answered<T>(
+	who: &str,
+	within: Duration,
+	future: impl Future<Output = T>,
+) -> CoreResult<T> {
+	tokio::time::timeout(within, future)
+		.await
+		.map_err(|_| unanswered(who, within))
+}
+
+/// The windows of the applications that answered, and the bus names of those
+/// that did not.
+pub struct AtSpiWindows {
+	pub windows:    Vec<AtSpiWindow>,
+	pub unanswered: Vec<String>,
+}
+
 /// An AT-SPI top-level frame and whether its reported screen position is real.
 ///
 /// Native Wayland clients cannot learn where the compositor placed them, so
@@ -139,21 +204,25 @@ pub struct AtSpiWindow {
 /// one that `holds_focus` (contains the keyboard-focused element) wins. Two
 /// active titled application windows leave none focused, rather than naming
 /// one at random.
+/// If an application did not answer, a shell or untitled candidate needs
+/// positive keyboard focus: Active alone may merely outlive the skipped app.
 pub fn resolve_focus(
 	windows: &mut [AtSpiWindow],
 	compositor_pid: Option<u32>,
+	unanswered: bool,
 	mut holds_focus: impl FnMut(&DesktopWindow) -> bool,
 ) {
 	let mut active: Vec<usize> = (0..windows.len())
 		.filter(|&index| windows[index].window.focused)
 		.collect();
-	if active.len() < 2 {
+	if active.len() < 2 && !unanswered {
 		return;
 	}
 	let all_active = active.clone();
-	if compositor_pid.is_some() {
+	if active.len() > 1 && compositor_pid.is_some() {
 		active.retain(|&index| windows[index].window.pid != compositor_pid);
 	}
+	let mut focus_checked = false;
 	if active.len() > 1 {
 		let titled: Vec<usize> = active
 			.iter()
@@ -161,6 +230,7 @@ pub fn resolve_focus(
 			.filter(|&index| !windows[index].window.title.trim().is_empty())
 			.collect();
 		active = if titled.is_empty() {
+			focus_checked = true;
 			active
 				.into_iter()
 				.filter(|&index| holds_focus(&windows[index].window))
@@ -170,12 +240,60 @@ pub fn resolve_focus(
 		};
 	}
 	let focused = match active.as_slice() {
-		[only] => Some(*only),
+		[only] => {
+			let window = &windows[*only].window;
+			let shell_candidate = window.title.trim().is_empty()
+				|| compositor_pid.is_some_and(|pid| window.pid == Some(pid));
+			(!unanswered || !shell_candidate || focus_checked || holds_focus(window)).then_some(*only)
+		},
 		_ => None,
 	};
 	for index in all_active {
 		windows[index].window.focused = Some(index) == focused;
 	}
+}
+
+/// Bound standalone child reads and focus searches independently of tree walks.
+const MAX_CHILDREN: u32 = 5_000;
+// Bound in-flight replies to avoid flooding the application's bus.
+const CHILD_READ_CONCURRENCY: usize = 32;
+
+/// Read at most `limit` children by index; a stale count never authorizes an
+/// unbounded whole-list request. Failed indices count as unread; if none
+/// answers, the first error is returned.
+async fn children_of(
+	proxy: &atspi::proxy::accessible::AccessibleProxy<'_>,
+	count: Option<u32>,
+	limit: u32,
+) -> zbus::Result<(Vec<ObjectRefOwned>, u32)> {
+	use futures::StreamExt;
+
+	let Some(count) = count else {
+		return Ok((Vec::new(), crate::desktop::ax::UNKNOWN_UNREAD_CHILDREN));
+	};
+	let read = limit.min(count);
+	let mut replies = futures::stream::iter(0..read)
+		.map(|index| proxy.get_child_at_index(index as i32))
+		.buffered(CHILD_READ_CONCURRENCY);
+	let mut children = Vec::with_capacity(read as usize);
+	let mut first_error = None;
+	let mut unread = count - read;
+	while let Some(reply) = replies.next().await {
+		match reply {
+			Ok(child) if !child.is_null() => children.push(child),
+			Ok(_) => unread += 1,
+			Err(err) => {
+				unread += 1;
+				first_error.get_or_insert(err);
+			},
+		}
+	}
+	if children.is_empty()
+		&& let Some(err) = first_error
+	{
+		return Err(err);
+	}
+	Ok((children, unread))
 }
 
 impl AtSpiAx {
@@ -184,10 +302,25 @@ impl AtSpiAx {
 			.enable_all()
 			.build()
 			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI runtime: {err}")))?;
+		// Not `AccessibilityConnection::new`: it also asks every application for
+		// a peer-to-peer address, so one application that does not answer
+		// would hang every new session and menu command.
 		let connection = rt
-			.block_on(atspi::AccessibilityConnection::new())
+			.block_on(async {
+				let session = Connection::session().await?;
+				let address = BusProxy::new(&session).await?.get_address().await?;
+				atspi::zbus::connection::Builder::address(address.as_str())?
+					.build()
+					.await
+			})
 			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI connection: {err}")))?;
-		Ok(Self { rt, connection, native: None, frames: FrameCache::default() })
+		Ok(Self {
+			rt,
+			connection,
+			reply_timeout: REPLY_TIMEOUT,
+			native: None,
+			frames: FrameCache::default(),
+		})
 	}
 
 	/// Places elements of toolkits that cannot report screen positions by
@@ -195,6 +328,25 @@ impl AtSpiAx {
 	pub(crate) fn with_native_windows(mut self, native: Box<dyn NativeWindows>) -> Self {
 		self.native = Some(native);
 		self
+	}
+
+	/// Runs `future` until it finishes or the current operation is cancelled,
+	/// so a call no application answers never holds the desktop worker past
+	/// the run that made it.
+	fn run<T>(&self, future: impl Future<Output = T>) -> CoreResult<T> {
+		self.rt.block_on(cancellable(future))
+	}
+
+	/// Single-element reads and mutations retain an operation budget.
+	/// Application, focus, ownership and hit-test scans use per-call replies.
+	fn request<T>(&self, future: impl Future<Output = CoreResult<T>>) -> CoreResult<T> {
+		self.run(answered("the application", self.reply_timeout, future))??
+	}
+
+	/// One call to an application, bounded on its own: for reads of a whole
+	/// application or menu, which can take longer than one reply may.
+	async fn reply<T>(&self, call: impl Future<Output = T>) -> CoreResult<T> {
+		answered("the application", self.reply_timeout, call).await
 	}
 
 	const fn object(h: &AxHandle) -> &ObjectRefOwned {
@@ -205,121 +357,158 @@ impl AtSpiAx {
 		}
 	}
 
-	pub(crate) fn windows(&self) -> CoreResult<Vec<AtSpiWindow>> {
-		self.rt.block_on(async {
-			let mut windows = Vec::new();
-			for app in Self::apps(&self.connection)
+	pub(crate) fn windows(&self) -> CoreResult<AtSpiWindows> {
+		self.run(async {
+			let apps = Self::apps(&self.connection)
 				.await
-				.map_err(DesktopError::ax_failed)?
-			{
-				let app_proxy = app
-					.as_accessible_proxy(self.connection.connection())
-					.await
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI application: {err}")))?;
-				let app_name = app_proxy.name().await.unwrap_or_default();
-				let pid = if let Some(bus_name) = app.name() {
-					let dbus = atspi::zbus::fdo::DBusProxy::new(self.connection.connection())
-						.await
-						.ok();
-					if let Some(dbus) = dbus {
-						dbus
-							.get_connection_unix_process_id(bus_name.clone().into())
-							.await
-							.ok()
-					} else {
-						None
-					}
-				} else {
-					None
-				};
-				for frame in Self::frames(&self.connection, &app)
-					.await
-					.unwrap_or_default()
-				{
-					let frame_proxy = frame
-						.as_accessible_proxy(self.connection.connection())
-						.await
-						.map_err(|err| DesktopError::ax_failed(format!("AT-SPI frame: {err}")))?;
-					let title = frame_proxy.name().await.unwrap_or_default();
-					let state = frame_proxy.get_state().await.ok();
-					let Ok(component) = Self::component(self.connection.connection(), &frame).await
-					else {
-						continue;
-					};
-					let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
-					else {
-						continue;
-					};
-					if width < 16 || height < 16 {
-						continue;
-					}
-					let position_known = component
-						.get_extents(CoordType::Window)
-						.await
-						.is_ok_and(|(window_x, window_y, ..)| (window_x, window_y) != (x, y));
-					let id = atspi_window_id(&frame);
-					windows.push(AtSpiWindow {
-						window: DesktopWindow {
-							id,
-							title,
-							app: app_name.clone(),
-							pid,
-							x,
-							y,
-							width: width as u32,
-							height: height as u32,
-							focused: state.as_ref().is_some_and(|states| {
-								states.contains(State::Focused) || states.contains(State::Active)
-							}),
-						},
-						position_known,
-					});
-					if windows.len() == 48 {
-						return Ok(windows);
-					}
+				.map_err(DesktopError::ax_failed)?;
+			// Every application is asked at once, so ones that do not answer
+			// cost the listing one reply limit together, not one each, and are
+			// left out rather than holding back every other application's.
+			let answers =
+				futures::future::join_all(apps.iter().map(|app| self.app_windows(app, MAX_WINDOWS)))
+					.await;
+			let mut listed = AtSpiWindows { windows: Vec::new(), unanswered: Vec::new() };
+			for (app, answer) in apps.iter().zip(answers) {
+				match answer {
+					Ok(windows) => listed.windows.extend(windows),
+					Err(error) if error.code == ErrorCode::Timeout => {
+						listed
+							.unanswered
+							.extend(app.name().map(ToString::to_string));
+					},
+					Err(error) => return Err(error),
 				}
 			}
-			Ok(windows)
-		})
+			listed.windows.truncate(MAX_WINDOWS);
+			Ok(listed)
+		})?
 	}
 
 	/// Whether the window's frame contains the keyboard-focused element. A
 	/// lookup that fails counts as not holding focus.
 	pub(crate) fn holds_focus(&self, window: &DesktopWindow) -> bool {
-		self.rt.block_on(async {
-			let Ok(app) = Self::app_for_window(&self.connection, window).await else {
-				return false;
-			};
-			let Ok(frames) = Self::frames(&self.connection, &app).await else {
-				return false;
-			};
-			for frame in frames {
-				if atspi_window_id(&frame) == window.id {
-					return Self::find_focused(self.connection.connection(), frame, 0)
-						.await
-						.is_ok_and(|found| found.is_some());
+		self
+			.run(async {
+				let Ok(app) = self.app_for_window(window).await else {
+					return false;
+				};
+				let Ok(frames) = Self::frames(&self.connection, &app, self.reply_timeout).await else {
+					return false;
+				};
+				for frame in frames {
+					if atspi_window_id(&frame) == window.id {
+						return Self::find_focused(&self.connection, frame, 0, self.reply_timeout)
+							.await
+							.is_ok_and(|found| found.is_some());
+					}
 				}
-			}
-			false
-		})
+				false
+			})
+			.unwrap_or(false)
 	}
 
-	async fn apps(
-		connection: &atspi::AccessibilityConnection,
-	) -> Result<Vec<ObjectRefOwned>, String> {
-		let root = connection
-			.root_accessible_on_registry()
+	async fn app_windows(&self, app: &ObjectRefOwned, limit: usize) -> CoreResult<Vec<AtSpiWindow>> {
+		let mut windows = Vec::new();
+		let app_proxy = self
+			.reply(app.as_accessible_proxy(&self.connection))
+			.await?
+			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI application: {err}")))?;
+		let app_name = self.reply(app_proxy.name()).await?.unwrap_or_default();
+		let pid = if let Some(bus_name) = app.name() {
+			let dbus = self
+				.reply(atspi::zbus::fdo::DBusProxy::new(&self.connection))
+				.await?
+				.ok();
+			if let Some(dbus) = dbus {
+				self
+					.reply(dbus.get_connection_unix_process_id(bus_name.clone().into()))
+					.await?
+					.ok()
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		let children = self
+			.reply(app_proxy.get_children())
+			.await?
+			.unwrap_or_default();
+		for frame in children {
+			let frame_proxy = self
+				.reply(frame.as_accessible_proxy(&self.connection))
+				.await?
+				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI frame: {err}")))?;
+			if !self
+				.reply(frame_proxy.get_role())
+				.await?
+				.is_ok_and(|role| top_level_role(role, true))
+			{
+				continue;
+			}
+			let title = self.reply(frame_proxy.name()).await?.unwrap_or_default();
+			let state = self.reply(frame_proxy.get_state()).await?.ok();
+			let Ok(component) = self
+				.reply(Self::component(&self.connection, &frame))
+				.await?
+			else {
+				continue;
+			};
+			let Ok((x, y, width, height)) =
+				self.reply(component.get_extents(CoordType::Screen)).await?
+			else {
+				continue;
+			};
+			if width < 16 || height < 16 {
+				continue;
+			}
+			let position_known = self
+				.reply(component.get_extents(CoordType::Window))
+				.await?
+				.is_ok_and(|(window_x, window_y, ..)| (window_x, window_y) != (x, y));
+			let id = atspi_window_id(&frame);
+			windows.push(AtSpiWindow {
+				window: DesktopWindow {
+					id,
+					title,
+					app: app_name.clone(),
+					pid,
+					x,
+					y,
+					width: width as u32,
+					height: height as u32,
+					focused: state.as_ref().is_some_and(|states| {
+						states.contains(State::Focused) || states.contains(State::Active)
+					}),
+				},
+				position_known,
+			});
+			if windows.len() == limit {
+				break;
+			}
+		}
+		Ok(windows)
+	}
+
+	async fn apps(connection: &Connection) -> Result<Vec<ObjectRefOwned>, String> {
+		// The registry implements too little of the D-Bus properties interface
+		// to cache its properties.
+		let root = AccessibleProxy::builder(connection)
+			.destination("org.a11y.atspi.Registry")
+			.map_err(|err| err.to_string())?
+			.cache_properties(CacheProperties::No)
+			.build()
 			.await
 			.map_err(|err| err.to_string())?;
 		root.get_children().await.map_err(|err| err.to_string())
 	}
 
-	async fn app_for_window(
-		connection: &atspi::AccessibilityConnection,
-		win: &DesktopWindow,
-	) -> Result<ObjectRefOwned, String> {
-		let apps = Self::apps(connection).await?;
+	async fn app_for_window(&self, win: &DesktopWindow) -> CoreResult<ObjectRefOwned> {
+		let failed = |err: String| DesktopError::ax_failed(format!("AT-SPI window root: {err}"));
+		let apps = Self::apps(&self.connection).await.map_err(failed)?;
 		let mut matches = Vec::new();
+		let mut unanswered_apps = false;
 		for app in apps {
 			if win.id.starts_with("atspi:") {
 				if app
@@ -330,69 +519,80 @@ impl AtSpiAx {
 				}
 				continue;
 			}
-			let proxy = app
-				.as_accessible_proxy(connection.connection())
-				.await
-				.map_err(|err| err.to_string())?;
-			let name = proxy.name().await.unwrap_or_default();
-			if win.pid.is_none() && name.eq_ignore_ascii_case(&win.app) {
-				matches.push(app.clone());
-			}
+			// The bus names an application's process without asking it.
 			if let Some(pid) = win.pid {
 				let Some(bus_name) = app.name() else {
 					continue;
 				};
-				let dbus = atspi::zbus::fdo::DBusProxy::new(connection.connection())
-					.await
-					.map_err(|err| err.to_string())?;
-				if dbus
-					.get_connection_unix_process_id(bus_name.clone().into())
-					.await
+				let dbus = self
+					.reply(atspi::zbus::fdo::DBusProxy::new(&self.connection))
+					.await?
+					.map_err(|err| failed(err.to_string()))?;
+				if self
+					.reply(dbus.get_connection_unix_process_id(bus_name.clone().into()))
+					.await?
 					.ok()
 					== Some(pid)
 				{
 					matches.push(app);
 				}
+				continue;
 			}
+			let proxy = self
+				.reply(app.as_accessible_proxy(&self.connection))
+				.await?
+				.map_err(|err| failed(err.to_string()))?;
+			match answered("the application", self.reply_timeout, proxy.name()).await {
+				Ok(name)
+					if name
+						.as_deref()
+						.unwrap_or_default()
+						.eq_ignore_ascii_case(&win.app) =>
+				{
+					matches.push(app.clone());
+				},
+				Ok(_) => {},
+				Err(_) => unanswered_apps = true,
+			}
+		}
+		// Without a process, an application that did not answer may be the
+		// named one, or another of that name.
+		if unanswered_apps {
+			return Err(unanswered("an application", self.reply_timeout));
 		}
 		if matches.len() == 1 {
 			Ok(matches.remove(0))
 		} else {
-			Err(format!(
+			Err(failed(format!(
 				"application '{}' (pid {:?}) has {} AT-SPI matches; refusing ambiguous ownership",
 				win.app,
 				win.pid,
 				matches.len()
-			))
+			)))
 		}
 	}
 
+	/// `app`'s children that are top-level windows. Each reply, not the
+	/// traversal, gets a deadline.
 	async fn frames(
-		connection: &atspi::AccessibilityConnection,
+		connection: &Connection,
 		app: &ObjectRefOwned,
-	) -> Result<Vec<ObjectRefOwned>, String> {
-		Self::top_levels(connection.connection(), app).await
-	}
-
-	/// `app`'s children that are top-level windows.
-	async fn top_levels(
-		connection: &atspi::zbus::Connection,
-		app: &ObjectRefOwned,
-	) -> Result<Vec<ObjectRefOwned>, String> {
-		let proxy = app
-			.as_accessible_proxy(connection)
-			.await
-			.map_err(|err| err.to_string())?;
-		let children = proxy.get_children().await.map_err(|err| err.to_string())?;
+		reply_timeout: Duration,
+	) -> CoreResult<Vec<ObjectRefOwned>> {
+		let proxy = answered("the application", reply_timeout, app.as_accessible_proxy(connection))
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+		let children = answered("the application", reply_timeout, proxy.get_children())
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
 		let mut frames = Vec::new();
 		for child in children {
-			let child_proxy = child
-				.as_accessible_proxy(connection)
-				.await
-				.map_err(|err| err.to_string())?;
-			if child_proxy
-				.get_role()
-				.await
+			let child_proxy =
+				answered("the application", reply_timeout, child.as_accessible_proxy(connection))
+					.await?
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+			if answered("the application", reply_timeout, child_proxy.get_role())
+				.await?
 				.is_ok_and(|role| top_level_role(role, true))
 			{
 				frames.push(child);
@@ -402,7 +602,7 @@ impl AtSpiAx {
 	}
 
 	async fn component<'a>(
-		connection: &'a zbus::Connection,
+		connection: &'a Connection,
 		object: &'a ObjectRefOwned,
 	) -> Result<atspi::proxy::component::ComponentProxy<'a>, String> {
 		let name = object
@@ -420,10 +620,10 @@ impl AtSpiAx {
 	}
 
 	/// `object`'s `Action` proxy, without zbus's property cache: the cache
-	/// reads properties with `GetAll`, which Qt refuses, so `NActions` would
-	/// fail on every Qt element.
+	/// fills itself with `GetAll`, which Qt 5 crashes on and newer Qt refuses,
+	/// so `NActions` is read with `Get`.
 	async fn action<'a>(
-		connection: &'a atspi::zbus::Connection,
+		connection: &'a Connection,
 		object: &'a ObjectRefOwned,
 	) -> Result<atspi::proxy::action::ActionProxy<'a>, String> {
 		let name = object
@@ -445,26 +645,27 @@ impl AtSpiAx {
 	/// containment: overlapping windows and same-process dialogs are distinct
 	/// input destinations.
 	async fn top_level(
-		connection: &atspi::zbus::Connection,
+		connection: &Connection,
 		mut object: ObjectRefOwned,
+		reply_timeout: Duration,
 	) -> CoreResult<ObjectRefOwned> {
 		for _ in 0..64 {
-			let proxy = object
-				.as_accessible_proxy(connection)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window owner: {err}")))?;
-			let role = proxy
-				.get_role()
-				.await
+			let proxy =
+				answered("the application", reply_timeout, object.as_accessible_proxy(connection))
+					.await?
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window owner: {err}")))?;
+			let role = answered("the application", reply_timeout, proxy.get_role())
+				.await?
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window role: {err}")))?;
 			if top_level_role(role, false) {
 				return Ok(object);
 			}
-			let parent = proxy
-				.parent()
-				.await
+			let parent = answered("the application", reply_timeout, proxy.parent())
+				.await?
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window parent: {err}")))?;
-			if top_level_role(role, true) && Self::is_application(connection, &parent).await {
+			if top_level_role(role, true)
+				&& Self::is_application(connection, &parent, reply_timeout).await?
+			{
 				return Ok(object);
 			}
 			if parent.is_null() || parent == object {
@@ -476,55 +677,99 @@ impl AtSpiAx {
 		Err(DesktopError::ax_failed("AT-SPI element has no identifiable top-level window"))
 	}
 
-	async fn is_application(connection: &atspi::zbus::Connection, object: &ObjectRefOwned) -> bool {
+	async fn is_application(
+		connection: &Connection,
+		object: &ObjectRefOwned,
+		reply_timeout: Duration,
+	) -> CoreResult<bool> {
 		if object.is_null() {
-			return false;
+			return Ok(false);
 		}
-		let Ok(proxy) = object.as_accessible_proxy(connection).await else {
-			return false;
+		let Ok(proxy) =
+			answered("the application", reply_timeout, object.as_accessible_proxy(connection)).await?
+		else {
+			return Ok(false);
 		};
-		proxy
-			.get_role()
-			.await
-			.is_ok_and(|role| role == Role::Application)
+		Ok(answered("the application", reply_timeout, proxy.get_role())
+			.await?
+			.is_ok_and(|role| role == Role::Application))
 	}
 
+	/// Each call has its own reply timeout: reading a whole application can
+	/// take longer than one reply may.
 	async fn find_focused(
-		connection: &atspi::zbus::Connection,
+		connection: &Connection,
 		root: ObjectRefOwned,
 		depth: u8,
-	) -> Result<Option<ObjectRefOwned>, String> {
+		reply_timeout: Duration,
+	) -> CoreResult<Option<ObjectRefOwned>> {
 		// Chromium/Electron frames report children that are the AT-SPI null
 		// object.
 		if depth > 40 || root.is_null() {
 			return Ok(None);
 		}
-		let proxy = root
-			.as_accessible_proxy(connection)
-			.await
-			.map_err(|err| err.to_string())?;
-		if proxy
-			.get_state()
-			.await
-			.is_ok_and(|state| state.contains(State::Focused))
-		{
+		let proxy = answered("the application", reply_timeout, root.as_accessible_proxy(connection))
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+		let state = answered("the application", reply_timeout, proxy.get_state()).await?;
+		if state.is_ok_and(|state| state.contains(State::Focused)) {
 			return Ok(Some(root));
 		}
-		for child in proxy.get_children().await.unwrap_or_default() {
-			if let Some(found) = Box::pin(Self::find_focused(connection, child, depth + 1)).await? {
+		let count = answered("the application", reply_timeout, proxy.child_count())
+			.await?
+			.ok()
+			.map(|count| count.max(0) as u32);
+		let (children, _) =
+			answered("the application", reply_timeout, children_of(&proxy, count, MAX_CHILDREN))
+				.await?
+				.unwrap_or_default();
+		for child in children {
+			if let Some(found) =
+				Box::pin(Self::find_focused(connection, child, depth + 1, reply_timeout)).await?
+			{
 				return Ok(Some(found));
 			}
 		}
 		Ok(None)
 	}
 
+	/// `h`'s children, at most `limit`, with the number left unread.
+	/// `count` is its `ChildCount` when already read.
+	fn read_children(
+		&self,
+		h: &AxHandle,
+		count: Option<u32>,
+		limit: u32,
+	) -> CoreResult<(Vec<AxHandle>, u32)> {
+		let object = Self::object(h).clone();
+		self.request(async {
+			let failed = |err: String| DesktopError::ax_failed(format!("AT-SPI children: {err}"));
+			let proxy = object
+				.as_accessible_proxy(&self.connection)
+				.await
+				.map_err(|err| failed(err.to_string()))?;
+			let count = match count {
+				Some(count) => Some(count),
+				None => proxy
+					.child_count()
+					.await
+					.ok()
+					.map(|count| count.max(0) as u32),
+			};
+			let (children, unread) = children_of(&proxy, count, limit)
+				.await
+				.map_err(|err| failed(err.to_string()))?;
+			Ok((children.into_iter().map(AxHandle::AtSpi).collect(), unread))
+		})
+	}
+
 	/// An element's properties, with its bounds when `bounds` asks for them.
 	fn read_props(&mut self, h: &AxHandle, bounds: WalkBounds) -> CoreResult<AxProps> {
 		let object = Self::object(h).clone();
-		let Self { rt, connection, native, frames } = self;
-		rt.block_on(async {
+		let Self { rt, connection, native, frames, reply_timeout } = self;
+		rt.block_on(cancellable(answered("the application", *reply_timeout, async {
 			let proxy = object
-				.as_accessible_proxy(connection.connection())
+				.as_accessible_proxy(connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI accessible: {err}")))?;
 			let title = proxy.name().await.ok().filter(|s| !s.is_empty());
@@ -540,34 +785,22 @@ impl AtSpiAx {
 			let multiline = state
 				.as_ref()
 				.is_some_and(|states| states.contains(State::MultiLine));
-			let value = if let Some(name) = object.name().cloned() {
-				let builder = atspi::proxy::text::TextProxy::builder(connection.connection())
-					.destination(name)
-					.and_then(|builder| builder.path(object.path().clone()));
-				if let Ok(builder) = builder
-					&& let Ok(text) = builder.build().await
-				{
-					let count = text.character_count().await.unwrap_or(0).min(16_384);
-					text.get_text(0, count).await.ok().filter(|s| !s.is_empty())
-				} else {
-					None
-				}
-			} else {
-				None
-			};
+			let value = text_value(&*connection, &object).await;
 			let bounds = if bounds == WalkBounds::Read {
 				frames
-					.screen_bounds(connection.connection(), native.as_deref(), &object)
+					.screen_bounds(connection, native.as_deref(), &object)
 					.await
 			} else {
 				None
 			};
-			let actions = match Self::action(connection.connection(), &object).await {
+			let actions = match Self::action(connection, &object).await {
 				Ok(action) => action_names(&action).await.unwrap_or_default(),
 				Err(_) => Vec::new(),
 			};
-			let child_count = proxy.child_count().await.unwrap_or(0).max(0) as u32;
+			let child_count = proxy.child_count().await;
 			Ok(AxProps {
+				#[cfg(test)]
+				read_as_fingerprint: None,
 				role: normalize_role_atspi(&native_role, multiline),
 				native_role,
 				title,
@@ -579,23 +812,30 @@ impl AtSpiAx {
 					.is_some_and(|states| states.contains(State::Focused)),
 				bounds,
 				actions,
-				child_count,
+				child_count: child_count.as_ref().copied().unwrap_or(0).max(0) as u32,
 				identity: None,
 				partial: false,
+				label_complete: false,
 				selected: false,
 				role_name: None,
+				unread_children: if child_count.is_err() {
+					crate::desktop::ax::UNKNOWN_UNREAD_CHILDREN
+				} else {
+					0
+				},
 			})
-		})
+		})))??
 	}
 
 	/// The deepest element under `root` at screen point (`x`, `y`). A placed
 	/// frame is hit-tested in its window coordinates.
 	async fn descend(
-		connection: &zbus::Connection,
+		connection: &Connection,
 		root: ObjectRefOwned,
 		placement: Option<Placement>,
 		x: i32,
 		y: i32,
+		reply_timeout: Duration,
 	) -> CoreResult<Option<AxHandle>> {
 		let (coords, x, y) = match placement {
 			Some(placement) => {
@@ -607,13 +847,14 @@ impl AtSpiAx {
 		let mut ancestors = Vec::new();
 		for _ in 0..64 {
 			let has_component = {
-				let accessible = current
-					.as_accessible_proxy(connection)
-					.await
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI hit-test element: {err}")))?;
-				accessible
-					.get_interfaces()
-					.await
+				let accessible =
+					answered("the application", reply_timeout, current.as_accessible_proxy(connection))
+						.await?
+						.map_err(|err| {
+							DesktopError::ax_failed(format!("AT-SPI hit-test element: {err}"))
+						})?;
+				answered("the application", reply_timeout, accessible.get_interfaces())
+					.await?
 					.map_err(|err| {
 						DesktopError::ax_failed(format!("AT-SPI hit-test interfaces: {err}"))
 					})?
@@ -624,26 +865,33 @@ impl AtSpiAx {
 			}
 			// GetAccessibleAtPoint returns an immediate child, not
 			// necessarily the leaf that owns the requested pixel.
-			let child = Self::component(connection, &current)
-				.await
-				.map_err(DesktopError::ax_failed)?
-				.get_accessible_at_point(x, y, coords)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI element at point: {err}")))?;
+			let component =
+				answered("the application", reply_timeout, Self::component(connection, &current))
+					.await?
+					.map_err(DesktopError::ax_failed)?;
+			let child = answered(
+				"the application",
+				reply_timeout,
+				component.get_accessible_at_point(x, y, coords),
+			)
+			.await?
+			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI element at point: {err}")))?;
 			if child.is_null() || child == current {
 				return Ok(Some(AxHandle::AtSpi(current)));
 			}
 			// GTK4 returns the deepest element from the frame, then offsets the
 			// point twice below it and can name a child the point is not in.
 			if placement.is_some() {
-				let inside = Self::component(connection, &child)
-					.await
-					.map_err(DesktopError::ax_failed)?
-					.get_extents(CoordType::Window)
-					.await
-					.is_ok_and(|(left, top, width, height)| {
-						Placement { x: left, y: top, width, height }.contains(x, y)
-					});
+				let component =
+					answered("the application", reply_timeout, Self::component(connection, &child))
+						.await?
+						.map_err(DesktopError::ax_failed)?;
+				let inside =
+					answered("the application", reply_timeout, component.get_extents(CoordType::Window))
+						.await?
+						.is_ok_and(|(left, top, width, height)| {
+							Placement { x: left, y: top, width, height }.contains(x, y)
+						});
 				if !inside {
 					return Ok(Some(AxHandle::AtSpi(current)));
 				}
@@ -871,6 +1119,65 @@ fn atspi_window_id(frame: &ObjectRefOwned) -> String {
 	format!("atspi:{name}:{}", frame.path())
 }
 
+/// How long a numeric write's read-back waits for the value to arrive, for
+/// a toolkit that applies the write a moment after answering it.
+const VALUE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Sets an element's numeric value and reads it back: a toolkit clamps the
+/// value to its range, rounds it to its steps or ignores it while answering
+/// the write (Qt answers every `CurrentValue` write), so the call reports
+/// what the element holds. The proxy keeps no property cache, whose
+/// `GetAll` crashes Qt 6 before 6.9.2 (QTBUG-137344).
+async fn write_value(
+	connection: &atspi::zbus::Connection,
+	name: &UniqueName<'static>,
+	object: &ObjectRefOwned,
+	value: f64,
+) -> CoreResult<()> {
+	let failed = |err: atspi::zbus::Error| DesktopError::ax_failed(format!("AT-SPI value: {err}"));
+	let proxy = atspi::proxy::value::ValueProxy::builder(connection)
+		.destination(name.clone())
+		.and_then(|b| b.path(object.path().clone()))
+		.map_err(failed)?
+		.cache_properties(atspi::zbus::proxy::CacheProperties::No)
+		.build()
+		.await
+		.map_err(failed)?;
+	proxy.set_current_value(value).await.map_err(failed)?;
+	let deadline = tokio::time::Instant::now() + VALUE_SETTLE;
+	loop {
+		let Ok(actual) = proxy.current_value().await else {
+			return Err(DesktopError::ax_failed(format!(
+				"wrote {value}, but the control's value could not be read back; inspect the target \
+				 before writing again"
+			)));
+		};
+		// Within float precision: a toolkit that stores the value as `float`
+		// reads back 0.3 as 0.30000001192092896.
+		if (actual - value).abs() <= value.abs().max(1.0) * f64::from(f32::EPSILON) {
+			return Ok(());
+		}
+		if tokio::time::Instant::now() >= deadline {
+			// The range only where it explains the value: an unbounded control
+			// reports ±f64::MAX, hundreds of digits each.
+			let range = match futures::join!(proxy.minimum_value(), proxy.maximum_value()) {
+				(Ok(min), _) if value < min && min != -f64::MAX => {
+					format!(" (its minimum is {min})")
+				},
+				(_, Ok(max)) if value > max && max != f64::MAX => {
+					format!(" (its maximum is {max})")
+				},
+				_ => String::new(),
+			};
+			return Err(DesktopError::ax_failed(format!(
+				"wrote {value}; the control now reads {actual}{range}. The app may have clamped, \
+				 rounded or not taken it: inspect the target before writing again"
+			)));
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+}
+
 /// Replaces an element's text and reads it back: Gecko (Firefox, Thunderbird)
 /// accepts the write and keeps the old text. A field that hides its text reads
 /// back one mask character per character, whatever its role (a GTK4 entry
@@ -884,6 +1191,7 @@ async fn write_text(
 	name: &UniqueName<'static>,
 	object: &ObjectRefOwned,
 	value: &str,
+	emptied: &mut bool,
 ) -> CoreResult<()> {
 	let editable = atspi::proxy::editable_text::EditableTextProxy::builder(connection)
 		.destination(name.clone())
@@ -915,62 +1223,263 @@ async fn write_text(
 		if replace("").await?.as_deref() != Some("") {
 			return text_readback(value, value, None, true);
 		}
-		let emptied = |mut error: DesktopError| {
-			error
-				.message
-				.push_str(". setValue emptied the field before this write, so it may now be empty");
-			error
-		};
-		let rewritten = replace(value).await.map_err(emptied)?;
+		// Keep the confirmed clear outside the request future so dropping the
+		// rewrite on timeout or cancellation does not lose the warning.
+		*emptied = true;
+		let rewritten = replace(value).await?;
 		if rewritten
 			.as_deref()
 			.is_some_and(|actual| masks(actual, value))
 		{
 			return Ok(());
 		}
-		return text_readback(value, value, None, true).map_err(emptied);
+		return text_readback(value, value, None, true);
 	}
-	// A role that cannot be read counts as a password field's, so no password
-	// enters an error.
-	let secure = actual.as_deref().is_some_and(masked)
-		|| accessible
-			.get_role()
-			.await
-			.ok()
-			.is_none_or(|role| role == Role::PasswordText);
+	// A role that cannot be read counts as a password field's, so what such a
+	// field reads never enters an error.
+	let secure = accessible
+		.get_role()
+		.await
+		.ok()
+		.is_none_or(|role| role == Role::PasswordText);
 	text_readback(value, value, actual.as_deref(), secure)
 }
 
-/// Whether `actual` is one repeated mask character: one of GTK's, or the `*`
-/// toolkits fall back on.
-fn masked(actual: &str) -> bool {
-	let mut chars = actual.chars();
-	chars.next().is_some_and(|first| {
-		['●', '•', '✱', '✺', '*'].contains(&first) && chars.all(|char| char == first)
-	})
+fn text_write_error(mut error: DesktopError, emptied: bool) -> DesktopError {
+	if emptied {
+		error
+			.message
+			.push_str(". setValue emptied the field before this write, so it may now be empty");
+	}
+	error
 }
-
-/// Whether `actual` masks `value`: one mask character per character, or per
-/// UTF-16 unit as Qt masks.
-fn masks(actual: &str, value: &str) -> bool {
-	let shown = actual.chars().count();
-	masked(actual) && (shown == value.chars().count() || shown == value.encode_utf16().count())
-}
-
 /// The whole text of an element with the `Text` interface.
 async fn text_contents(
 	connection: &atspi::zbus::Connection,
 	name: &UniqueName<'static>,
 	object: &ObjectRefOwned,
 ) -> atspi::zbus::Result<String> {
-	let text = atspi::proxy::text::TextProxy::builder(connection)
+	whole_text(&text_proxy(connection, name, object).await?).await
+}
+
+/// All of the text `text` reads.
+async fn whole_text(text: &atspi::proxy::text::TextProxy<'_>) -> atspi::zbus::Result<String> {
+	let count = text.character_count().await?;
+	text.get_text(0, count).await
+}
+
+/// What the AT-SPI text route did with text typed into an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextRoute {
+	/// The element took the text, and reads back as typing would leave it.
+	Inserted,
+	/// The element offers no route that leaves it as typing would; nothing
+	/// was written.
+	Absent,
+	/// The element offers the interfaces, but its toolkit applies a write
+	/// differently from typing, for the reason given; nothing was written.
+	Declined(&'static str),
+}
+
+/// Why a Qt single-line field declines the route. Qt's widgets apply an
+/// accessible insert, delete or replace on a line edit as `setText` of the
+/// whole new text (`QAccessibleLineEdit` in `simplewidgets.cpp`, Qt 5.15 and
+/// 6), and spin boxes, date edits and editable combo boxes pass theirs to
+/// their line edit, so the write skips what typing goes through. Qt's
+/// multi-line text edits insert through a `QTextCursor`, as typing does.
+pub(crate) const QT_LINE_EDIT_SETS_TEXT: &str =
+	"Qt applies an accessibility insert to a single-line field by replacing its whole text, which \
+	 skips the field's validator and input mask and does not count as a user edit";
+
+/// Puts `text` into an element as focusing it and typing would, through the
+/// element's AT-SPI `Text` and `EditableText` interfaces: the text replaces
+/// the element's selection, or goes in at its caret. An unfocused GTK entry
+/// takes it only for an empty or fully selected value: then either
+/// selection-on-focus setting leaves the same result.
+/// No keys are sent and no focus moves. `Absent` means the element took
+/// nothing, so keys may follow: its application's `toolkit` is neither GTK
+/// nor Qt (unnamed included), it lacks either interface, is or may be a
+/// password field, is read-only or disabled, its text or caret could not be
+/// read, or it left its text as it was after the write. `Declined` means the
+/// same for a single-line field of a Qt application
+/// ([`QT_LINE_EDIT_SETS_TEXT`]) or a GTK entry whose focus selection is
+/// unknown. Text changed to anything other than what typing would give is an
+/// error, after which nothing more is sent.
+///
+/// GTK applies the insert through the field's own `insert-text` handlers, and
+/// Qt's multi-line edits through a `QTextCursor`, so the field validates and
+/// signals the edit as for typing; a GTK 4 entry records no undo step for it.
+/// Other toolkits keep keys, as their inserts were not shown to act as typing:
+/// Firefox 160 answers `true` and keeps the old text, and Writer
+/// (`LibreOffice`) took the insert in 1 of 10 tries.
+///
+/// Only printable ASCII goes this way, into a field whose text has no
+/// character outside the Basic Multilingual Plane: `InsertText`'s length is
+/// UTF-8 bytes in GTK 3 (`gtk_editable_insert_text`) and UTF-16 units in Qt
+/// (`QString::resize` in its `AtSpiAdaptor`), and Qt's offsets count UTF-16
+/// units where GTK's count characters, so outside those limits the units
+/// disagree. Control characters, such as a newline, are keys that act (Return
+/// submits a form), not text to insert.
+async fn insert_typed_text(
+	connection: &atspi::zbus::Connection,
+	accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+	name: &UniqueName<'static>,
+	object: &ObjectRefOwned,
+	toolkit: &str,
+	text: &str,
+) -> CoreResult<TextRoute> {
+	const ABSENT: CoreResult<TextRoute> = Ok(TextRoute::Absent);
+	let qt = toolkit.eq_ignore_ascii_case("qt");
+	if !qt && !toolkit.eq_ignore_ascii_case("gtk") {
+		return ABSENT;
+	}
+	if text.is_empty() || !text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+		return ABSENT;
+	}
+	let Ok(interfaces) = accessible.get_interfaces().await else {
+		return ABSENT;
+	};
+	if !interfaces.contains(atspi::Interface::EditableText)
+		|| !interfaces.contains(atspi::Interface::Text)
+	{
+		return ABSENT;
+	}
+	// A role that cannot be read counts as a password field's, as for setValue.
+	if accessible
+		.get_role()
+		.await
+		.ok()
+		.is_none_or(|role| role == Role::PasswordText)
+	{
+		return ABSENT;
+	}
+	// Typing changes nothing in a read-only or disabled field, while an insert
+	// would: Qt's line edit takes one either way.
+	let Ok(states) = accessible.get_state().await else {
+		return ABSENT;
+	};
+	if !states.contains(State::Editable)
+		|| states.contains(State::ReadOnly)
+		|| !state_enabled(states)
+	{
+		return ABSENT;
+	}
+	if qt && !states.contains(State::MultiLine) {
+		return Ok(TextRoute::Declined(QT_LINE_EDIT_SETS_TEXT));
+	}
+	let Ok(reader) = text_proxy(connection, name, object).await else {
+		return ABSENT;
+	};
+	let Ok(before) = whole_text(&reader).await else {
+		return ABSENT;
+	};
+	let length = before.chars().count();
+	// A field showing a mask hides its text (a GTK 4 entry with visibility off
+	// is a plain `Text`), so where its caret falls cannot be checked.
+	if crate::desktop::ax::masked(&before) || length != before.encode_utf16().count() {
+		return ABSENT;
+	}
+	let Ok(caret) = reader.caret_offset().await else {
+		return ABSENT;
+	};
+	let (start, end) = match reader.get_n_selections().await {
+		Ok(0) => (caret, caret),
+		Ok(_) => match reader.get_selection(0).await {
+			Ok((from, to)) => (from.min(to), from.max(to)),
+			Err(_) => return ABSENT,
+		},
+		Err(_) => return ABSENT,
+	};
+	// GTK's per-application select-on-focus setting is not exposed by AT-SPI.
+	// Only an empty or already fully selected value gives the same edit with
+	// either setting, so no inferred selection may delete existing text.
+	if !(qt
+		|| states.contains(State::Focused)
+		|| states.contains(State::MultiLine)
+		|| start == 0 && usize::try_from(end).ok() == Some(length))
+	{
+		return Ok(TextRoute::Declined("the field's selection after focusing is unknown"));
+	}
+	let (Ok(first), Ok(last)) = (usize::try_from(start), usize::try_from(end)) else {
+		return ABSENT;
+	};
+	if last > length {
+		return ABSENT;
+	}
+	let expected: String = before
+		.chars()
+		.take(first)
+		.chain(text.chars())
+		.chain(before.chars().skip(last))
+		.collect();
+	let Ok(editable) = atspi::proxy::editable_text::EditableTextProxy::builder(connection)
+		.destination(name.clone())
+		.and_then(|b| b.path(object.path().clone()))
+	else {
+		return ABSENT;
+	};
+	let Ok(editable) = editable.build().await else {
+		return ABSENT;
+	};
+	// ASCII: as many bytes as characters and UTF-16 units.
+	let inserted = i32::try_from(text.len())
+		.map_err(|_| DesktopError::ax_failed("text is too long for an AT-SPI insert"))?;
+	// The app's answers are not proof either way; what the field reads is.
+	if start < end {
+		let _ = editable.delete_text(start, end).await;
+	}
+	let _ = editable.insert_text(start, text, inserted).await;
+	let actual = whole_text(&reader).await.ok();
+	if actual
+		.as_deref()
+		.is_some_and(|actual| actual == expected || masks(actual, &expected))
+	{
+		// A GTK 3 text view does not move its caret on an insert
+		// (`gtktextviewaccessible.c`); typing leaves it after the text.
+		let _ = reader.set_caret_offset(start + inserted).await;
+		return Ok(TextRoute::Inserted);
+	}
+	if actual.as_deref() == Some(before.as_str()) {
+		return ABSENT;
+	}
+	let secure = actual.as_deref().is_some_and(crate::desktop::ax::masked);
+	text_readback(text, &expected, actual.as_deref(), secure).map(|()| TextRoute::Inserted)
+}
+
+/// The element's `Text` interface, read live: its caret and length change
+/// under every write.
+async fn text_proxy(
+	connection: &atspi::zbus::Connection,
+	name: &UniqueName<'static>,
+	object: &ObjectRefOwned,
+) -> atspi::zbus::Result<atspi::proxy::text::TextProxy<'static>> {
+	atspi::proxy::text::TextProxy::builder(connection)
 		.destination(name.clone())?
 		.path(object.path().clone())?
 		.cache_properties(atspi::zbus::proxy::CacheProperties::No)
 		.build()
-		.await?;
-	let count = text.character_count().await?;
-	text.get_text(0, count).await
+		.await
+}
+
+/// The text of an element with the `Text` interface, up to 16,384 characters.
+/// The proxy keeps no property cache: zbus fills one with `GetAll`, which
+/// crashes Qt 5 and Qt 6 before 6.9.2, and GTK 3 and Firefox apps on
+/// at-spi2-core before 2.45; newer Qt refuses it.
+async fn text_value(
+	connection: &atspi::zbus::Connection,
+	object: &ObjectRefOwned,
+) -> Option<String> {
+	let text = atspi::proxy::text::TextProxy::builder(connection)
+		.destination(object.name()?.clone())
+		.ok()?
+		.path(object.path().clone())
+		.ok()?
+		.cache_properties(atspi::zbus::proxy::CacheProperties::No)
+		.build()
+		.await
+		.ok()?;
+	let count = text.character_count().await.unwrap_or(0).min(16_384);
+	text.get_text(0, count).await.ok().filter(|s| !s.is_empty())
 }
 
 fn native_window_for_frame(windows: &[DesktopWindow], pid: u32, title: &str) -> CoreResult<String> {
@@ -1000,37 +1509,43 @@ const fn top_level_role(role: Role, child_of_application: bool) -> bool {
 	}
 }
 
+/// Machine names that activate an element, compared by [`folds_to`]: GTK
+/// (`click`, `activate`), Qt (`Toggle`), Chromium and Electron (`click`,
+/// `open`, `jump`, `clickAncestor`, and `doDefault` on elements without a
+/// verb), and `do default` / `do-default` from other ATK bridges. `press`
+/// itself matches before these are tried.
+const ACTIVATIONS: [&str; 8] =
+	["click", "clickancestor", "activate", "invoke", "toggle", "open", "jump", "dodefault"];
+
+/// Chromium's, Firefox's and `LibreOffice`'s activation of menu items,
+/// options and tabs, taken only when an element has none of [`ACTIVATIONS`]:
+/// a GTK colour swatch lists `select` (set the selected flag) before
+/// `activate`.
+const SELECT: &str = "select";
+
+/// Whether `name` is `safe`, ignoring case and the spaces, hyphens and
+/// underscores toolkits spell action names with.
+fn folds_to(name: &str, safe: &str) -> bool {
+	name
+		.bytes()
+		.filter(|byte| !matches!(byte, b' ' | b'-' | b'_'))
+		.map(|byte| byte.to_ascii_lowercase())
+		.eq(safe.bytes())
+}
+
 /// Generic press means activation, not action zero (GTK4 text views put
 /// `buffer.delete-line` there). Explicit advertised actions remain available.
 fn action_index<'a>(
-	mut actions: impl Iterator<Item = &'a str> + Clone,
+	actions: impl Iterator<Item = &'a str> + Clone,
 	requested: &str,
 ) -> Option<usize> {
-	actions
-		.clone()
-		.position(|name| name.eq_ignore_ascii_case(requested))
-		.or_else(|| {
-			requested
-				.eq_ignore_ascii_case("press")
-				.then(|| {
-					actions.position(|name| {
-						[
-							"click",
-							"clickAncestor",
-							"activate",
-							"invoke",
-							"toggle",
-							"open",
-							"jump",
-							"do default",
-							"do-default",
-						]
-						.iter()
-						.any(|safe| name.eq_ignore_ascii_case(safe))
-					})
-				})
-				.flatten()
-		})
+	let position = |matches: &dyn Fn(&str) -> bool| actions.clone().position(matches);
+	position(&|name| name.eq_ignore_ascii_case(requested)).or_else(|| {
+		requested.eq_ignore_ascii_case("press").then(|| {
+			position(&|name| ACTIVATIONS.iter().any(|safe| folds_to(name, safe)))
+				.or_else(|| position(&|name| folds_to(name, SELECT)))
+		})?
+	})
 }
 
 /// The most actions read of one element: the count comes from the app.
@@ -1083,65 +1598,79 @@ async fn resolve_action(
 impl AxBackend for AtSpiAx {
 	fn window_root(&mut self, win: &DesktopWindow) -> CoreResult<AxHandle> {
 		self.frames = FrameCache::default();
-		let result = self.rt.block_on(async {
-			let app = Self::app_for_window(&self.connection, win).await?;
-			let frames = Self::frames(&self.connection, &app).await?;
-			let mut matches = Vec::new();
-			for frame in frames {
-				let id = atspi_window_id(&frame);
-				if win.id.starts_with("atspi:") {
-					if id == win.id {
-						return Ok(frame);
+		let failed = |err: String| DesktopError::ax_failed(format!("AT-SPI window root: {err}"));
+		self
+			.run(async {
+				let app = self.app_for_window(win).await?;
+				let frames = Self::frames(&self.connection, &app, self.reply_timeout).await?;
+				let mut matches = Vec::new();
+				for frame in frames {
+					let id = atspi_window_id(&frame);
+					if win.id.starts_with("atspi:") {
+						if id == win.id {
+							return Ok(frame);
+						}
+						continue;
 					}
-					continue;
+					let proxy = self
+						.reply(frame.as_accessible_proxy(&self.connection))
+						.await?
+						.map_err(|err| failed(err.to_string()))?;
+					if self
+						.reply(proxy.name())
+						.await?
+						.map_err(|err| failed(err.to_string()))?
+						== win.title
+					{
+						matches.push(frame);
+					}
 				}
-				let proxy = frame
-					.as_accessible_proxy(self.connection.connection())
-					.await
-					.map_err(|err| err.to_string())?;
-				if proxy.name().await.map_err(|err| err.to_string())? == win.title {
-					matches.push(frame);
+				if matches.len() == 1 {
+					Ok(matches.remove(0))
+				} else {
+					Err(failed(format!(
+						"window '{}' has {} matching AT-SPI frames",
+						win.title,
+						matches.len()
+					)))
 				}
-			}
-			if matches.len() == 1 {
-				Ok(matches.remove(0))
-			} else {
-				Err(format!("window '{}' has {} matching AT-SPI frames", win.title, matches.len()))
-			}
-		});
-		result
+			})?
 			.map(AxHandle::AtSpi)
-			.map_err(|err: String| DesktopError::ax_failed(format!("AT-SPI window root: {err}")))
 	}
 
 	fn window_id(&mut self, h: &AxHandle, windows: &[DesktopWindow]) -> CoreResult<String> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
-			let connection = self.connection.connection();
-			let object = Self::top_level(connection, object).await?;
-			let id = atspi_window_id(&object);
-			if windows.iter().any(|window| window.id == id) {
-				return Ok(id);
-			}
-			let name = object
-				.name()
-				.ok_or_else(|| DesktopError::ax_failed("AT-SPI window has no bus owner"))?;
-			let dbus = atspi::zbus::fdo::DBusProxy::new(connection)
-				.await
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
-			let pid = dbus
-				.get_connection_unix_process_id(name.clone().into())
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window pid: {err}")))?;
-			let title = object
-				.as_accessible_proxy(connection)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window owner: {err}")))?
-				.name()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window title: {err}")))?;
-			native_window_for_frame(windows, pid, &title)
-		})
+		self.run(async {
+			let connection = &self.connection;
+			let object = Self::top_level(connection, object, self.reply_timeout).await?;
+			// The ancestry scan is per-reply; the following single-window
+			// identification keeps its operation budget.
+			answered("the application", self.reply_timeout, async {
+				let id = atspi_window_id(&object);
+				if windows.iter().any(|window| window.id == id) {
+					return Ok(id);
+				}
+				let name = object
+					.name()
+					.ok_or_else(|| DesktopError::ax_failed("AT-SPI window has no bus owner"))?;
+				let dbus = atspi::zbus::fdo::DBusProxy::new(connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+				let pid = dbus
+					.get_connection_unix_process_id(name.clone().into())
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window pid: {err}")))?;
+				let title = object
+					.as_accessible_proxy(connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window owner: {err}")))?
+					.name()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window title: {err}")))?;
+				native_window_for_frame(windows, pid, &title)
+			})
+			.await?
+		})?
 	}
 
 	fn props(&mut self, h: &AxHandle) -> CoreResult<AxProps> {
@@ -1153,36 +1682,28 @@ impl AxBackend for AtSpiAx {
 		&mut self,
 		h: &AxHandle,
 		bounds: WalkBounds,
+		max_children: u32,
 	) -> CoreResult<(AxProps, Vec<AxHandle>)> {
-		Ok((self.read_props(h, bounds)?, self.children(h)?))
+		let mut props = self.read_props(h, bounds)?;
+		if props.unread_children > 0 {
+			return Ok((props, Vec::new()));
+		}
+		let (children, unread) = self.read_children(h, Some(props.child_count), max_children)?;
+		props.unread_children = unread;
+		Ok((props, children))
 	}
 
 	fn children(&mut self, h: &AxHandle) -> CoreResult<Vec<AxHandle>> {
-		let object = Self::object(h).clone();
-		self.rt.block_on(async {
-			let proxy = object
-				.as_accessible_proxy(self.connection.connection())
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI children: {err}")))?;
-			proxy
-				.get_children()
-				.await
-				.map(|items| {
-					items
-						.into_iter()
-						.filter(|item| !item.is_null())
-						.map(AxHandle::AtSpi)
-						.collect()
-				})
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI children: {err}")))
-		})
+		self
+			.read_children(h, None, MAX_CHILDREN)
+			.map(|(children, _)| children)
 	}
 
 	fn parent(&mut self, h: &AxHandle) -> CoreResult<Option<AxHandle>> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		self.request(async {
 			let proxy = object
-				.as_accessible_proxy(self.connection.connection())
+				.as_accessible_proxy(&self.connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI parent: {err}")))?;
 			let parent = proxy
@@ -1195,96 +1716,156 @@ impl AxBackend for AtSpiAx {
 
 	fn perform(&mut self, h: &AxHandle, action: &str) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
-			let proxy = Self::action(self.connection.connection(), &object)
-				.await
-				.map_err(DesktopError::ax_failed)?;
-			let accessible = object
-				.as_accessible_proxy(self.connection.connection())
-				.await
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
-			let index = resolve_action(&proxy, &accessible, action).await?;
-			proxy
-				.do_action(index)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI action: {err}")))?
-				.ok_or_else(|| DesktopError::ax_failed(format!("AT-SPI action '{action}' failed")))
-		})
+		self
+			.request(async {
+				let proxy = Self::action(&self.connection, &object)
+					.await
+					.map_err(DesktopError::ax_failed)?;
+				let accessible = object
+					.as_accessible_proxy(&self.connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+				let index = resolve_action(&proxy, &accessible, action).await?;
+				let role = accessible
+					.get_role()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI role: {err}")))?;
+				if role == Role::ComboBox {
+					let name = proxy
+						.get_name(index)
+						.await
+						.map_err(|err| DesktopError::ax_failed(format!("AT-SPI actions: {err}")))?;
+					if combo::opens_grabbing_list(&name) {
+						return Err(self.combo_press_refusal(&object).await?);
+					}
+				}
+				proxy
+					.do_action(index)
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI action: {err}")))?
+					.ok_or_else(|| DesktopError::ax_failed(format!("AT-SPI action '{action}' failed")))
+			})
+			.map_err(unconfirmed)
+	}
+
+	fn perform_menu(&mut self, h: &AxHandle, action: &str, path: &[String]) -> CoreResult<()> {
+		let object = Self::object(h).clone();
+		self
+			.request(async {
+				let role = object
+					.as_accessible_proxy(&self.connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?
+					.get_role()
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+				if !action.eq_ignore_ascii_case("press") || role != Role::ComboBox {
+					return Err(DesktopError::new(
+						ErrorCode::Unsupported,
+						"choosing a menu item in the action that opens the menu is available on Linux \
+						 only for a combo box's press, and on macOS",
+					));
+				}
+				let [value] = path else {
+					return Err(DesktopError::ax_failed(
+						"a combo box option is one title: pass menu: [\"<option>\"]",
+					));
+				};
+				self.combo_choose(&object, value).await
+			})
+			.map_err(unconfirmed)
 	}
 
 	fn set_value(&mut self, h: &AxHandle, value: &str) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
-			let name = object
-				.name()
-				.ok_or_else(|| DesktopError::ax_failed("AT-SPI object has no bus name"))?
-				.clone();
-			let accessible = object
-				.as_accessible_proxy(self.connection.connection())
-				.await
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
-			let interfaces = accessible
-				.get_interfaces()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI interfaces: {err}")))?;
-			if interfaces.contains(atspi::Interface::EditableText) {
-				return write_text(self.connection.connection(), &accessible, &name, &object, value)
+		let mut emptied = false;
+		self
+			.request(async {
+				let name = object
+					.name()
+					.ok_or_else(|| DesktopError::ax_failed("AT-SPI object has no bus name"))?
+					.clone();
+				let accessible = object
+					.as_accessible_proxy(&self.connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+				let interfaces = accessible
+					.get_interfaces()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI interfaces: {err}")))?;
+				if interfaces.contains(atspi::Interface::EditableText) {
+					return write_text(
+						&self.connection,
+						&accessible,
+						&name,
+						&object,
+						value,
+						&mut emptied,
+					)
 					.await;
-			}
-			if !interfaces.contains(atspi::Interface::Value) {
-				return Err(DesktopError::ax_failed("AT-SPI element has no writable value interface"));
-			}
-			let numeric = value.parse::<f64>().map_err(|_| {
-				DesktopError::ax_failed("AT-SPI value is not editable text or a number")
-			})?;
-			if !numeric.is_finite() {
-				return Err(DesktopError::ax_failed("AT-SPI numeric value must be finite"));
-			}
-			let proxy = atspi::proxy::value::ValueProxy::builder(self.connection.connection())
-				.destination(name)
-				.and_then(|b| b.path(object.path().clone()))
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?
-				.build()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI value: {err}")))?;
-			proxy
-				.set_current_value(numeric)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI value: {err}")))
-		})
+				}
+				if accessible
+					.get_role()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI role: {err}")))?
+					== Role::ComboBox
+				{
+					return self.combo_choose(&object, value).await;
+				}
+				if !interfaces.contains(atspi::Interface::Value) {
+					return Err(DesktopError::ax_failed(
+						"AT-SPI element has no writable value interface",
+					));
+				}
+				let numeric = value.parse::<f64>().map_err(|_| {
+					DesktopError::ax_failed("AT-SPI value is not editable text or a number")
+				})?;
+				if !numeric.is_finite() {
+					return Err(DesktopError::ax_failed("AT-SPI numeric value must be finite"));
+				}
+				write_value(&self.connection, &name, &object, numeric).await
+			})
+			.map_err(|error| text_write_error(unconfirmed(error), emptied))
 	}
 
 	fn focus(&mut self, h: &AxHandle) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
-			let component = Self::component(self.connection.connection(), &object)
-				.await
-				.map_err(DesktopError::ax_failed)?;
-			component
-				.grab_focus()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI focus: {err}")))?
-				.ok_or_else(|| DesktopError::ax_failed("AT-SPI focus request was rejected"))
-		})
+		self
+			.request(async {
+				let component = Self::component(&self.connection, &object)
+					.await
+					.map_err(DesktopError::ax_failed)?;
+				component
+					.grab_focus()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI focus: {err}")))?
+					.ok_or_else(|| DesktopError::ax_failed("AT-SPI focus request was rejected"))
+			})
+			.map_err(unconfirmed)
 	}
 
 	fn element_at(&mut self, x: f64, y: f64) -> CoreResult<Option<AxHandle>> {
 		let x = x.round() as i32;
 		let y = y.round() as i32;
-		let Self { rt, connection, native, frames: cache } = self;
+		let Self { rt, connection, native, frames: cache, reply_timeout } = self;
 		cache.refresh();
-		rt.block_on(async {
-			let bus = connection.connection();
+		rt.block_on(cancellable(async {
+			let bus = &*connection;
 			let mut root: Option<(ObjectRefOwned, Option<Placement>)> = None;
 			for app in Self::apps(connection)
 				.await
 				.map_err(DesktopError::ax_failed)?
 			{
-				for frame in Self::frames(connection, &app)
-					.await
-					.map_err(DesktopError::ax_failed)?
-				{
-					let Some(placement) = cache.claim(bus, native.as_deref(), &frame, x, y).await?
+				let frames = Self::frames(connection, &app, *reply_timeout).await?;
+				for frame in frames {
+					// This probes one frame, not the traversal: retain its
+					// single-element operation budget.
+					let Some(placement) = answered(
+						"the application",
+						*reply_timeout,
+						cache.claim(bus, native.as_deref(), &frame, x, y),
+					)
+					.await??
 					else {
 						continue;
 					};
@@ -1305,32 +1886,39 @@ impl AxBackend for AtSpiAx {
 			let Some((root, placement)) = root else {
 				return Ok(None);
 			};
-			Self::descend(bus, root, placement, x, y).await
-		})
+			Self::descend(bus, root, placement, x, y, *reply_timeout).await
+		}))?
 	}
 
 	fn focused_element(&mut self) -> CoreResult<Option<AxHandle>> {
-		self.rt.block_on(async {
+		self.run(async {
+			let mut unanswered_app = false;
 			for app in Self::apps(&self.connection)
 				.await
 				.map_err(DesktopError::ax_failed)?
 			{
-				if let Some(found) = Self::find_focused(self.connection.connection(), app, 0)
-					.await
-					.map_err(DesktopError::ax_failed)?
-				{
-					return Ok(Some(AxHandle::AtSpi(found)));
+				match Self::find_focused(&self.connection, app, 0, self.reply_timeout).await {
+					Ok(Some(found)) => return Ok(Some(AxHandle::AtSpi(found))),
+					Ok(None) => {},
+					// The focus may be in an application that does not answer,
+					// which no other application's lack of focus rules out.
+					Err(error) if error.code == ErrorCode::Timeout => unanswered_app = true,
+					Err(error) => return Err(error),
 				}
 			}
-			Ok(None)
-		})
+			if unanswered_app {
+				Err(unanswered("an application", self.reply_timeout))
+			} else {
+				Ok(None)
+			}
+		})?
 	}
 
 	fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		self.request(async {
 			let proxy = object
-				.as_accessible_proxy(self.connection.connection())
+				.as_accessible_proxy(&self.connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI attributes: {err}")))?;
 			let mut attrs: Vec<_> = proxy
@@ -1369,8 +1957,8 @@ impl AtSpiAx {
 			DesktopError::ax_failed(format!("AT-SPI focus state: {error}"))
 		}
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
-			let connection = self.connection.connection();
+		self.request(async {
+			let connection = &self.connection;
 			let proxy = object
 				.as_accessible_proxy(connection)
 				.await
@@ -1380,32 +1968,142 @@ impl AtSpiAx {
 				.await
 				.map_err(failed)?
 				.contains(State::Focused);
-			let app = proxy.get_application().await.map_err(failed)?;
-			let toolkit = async {
-				let app = atspi::proxy::application::ApplicationProxy::builder(connection)
-					.destination(app.name()?.clone())
-					.ok()?
-					.path(app.path().clone())
-					.ok()?
-					// atk-bridge answers `Get` for these properties, not `GetAll`.
-					.cache_properties(zbus::proxy::CacheProperties::No)
-					.build()
-					.await
-					.ok()?;
-				let toolkit = app.toolkit_name().await.ok()?;
-				let version = app.version().await.unwrap_or_default();
-				Some((toolkit, version))
-			}
-			.await;
-			let (toolkit, version) = toolkit.unwrap_or_default();
+			let (toolkit, version) = app_toolkit(connection, &proxy).await.unwrap_or_default();
 			Ok(ElementFocus { focused, toolkit, version })
 		})
 	}
+
+	/// Puts `text` into the element through its AT-SPI text interfaces, as
+	/// typing it would ([`insert_typed_text`]).
+	pub(crate) fn type_text(&self, h: &AxHandle, text: &str) -> CoreResult<TextRoute> {
+		let object = Self::object(h).clone();
+		let Some(name) = object.name().cloned() else {
+			return Ok(TextRoute::Absent);
+		};
+		self.request(async {
+			let connection = &self.connection;
+			let Ok(accessible) = object.as_accessible_proxy(connection).await else {
+				return Ok(TextRoute::Absent);
+			};
+			let (toolkit, _) = app_toolkit(connection, &accessible)
+				.await
+				.unwrap_or_default();
+			insert_typed_text(connection, &accessible, &name, &object, &toolkit, text).await
+		})
+	}
+}
+
+/// The toolkit name and version the element's application reports, if any.
+async fn app_toolkit(
+	connection: &atspi::zbus::Connection,
+	accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+) -> Option<(String, String)> {
+	let app = accessible.get_application().await.ok()?;
+	let app = atspi::proxy::application::ApplicationProxy::builder(connection)
+		.destination(app.name()?.clone())
+		.ok()?
+		.path(app.path().clone())
+		.ok()?
+		// atk-bridge answers `Get` for these properties, not `GetAll`.
+		.cache_properties(zbus::proxy::CacheProperties::No)
+		.build()
+		.await
+		.ok()?;
+	let toolkit = app.toolkit_name().await.ok()?;
+	let version = app.version().await.unwrap_or_default();
+	Some((toolkit, version))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn text_value_reads_text_without_get_all() {
+		use atspi::zbus::{
+			MessageStream, connection::Builder as ConnectionBuilder, message::Type, zvariant::Value,
+		};
+		use futures::StreamExt;
+
+		const TEXT: &str = "org.a11y.atspi.Text";
+		const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+		const PEER: &str = ":1.7";
+
+		// Reject GetAll on any interface rather than crashing as affected apps
+		// do.
+		async fn app(server: atspi::zbus::Connection, calls: &mut Vec<(String, String)>) {
+			let mut stream = MessageStream::from(&server);
+			while let Some(message) = stream.next().await {
+				let message = message.unwrap();
+				if message.message_type() != Type::MethodCall {
+					continue;
+				}
+				let header = message.header();
+				let interface = header.interface().unwrap().as_str();
+				let member = header.member().unwrap().as_str();
+				match (interface, member) {
+					(PROPERTIES, "GetAll") => {
+						let requested: String = message.body().deserialize().unwrap();
+						calls.push((member.to_owned(), requested));
+						server
+							.reply_error(
+								&header,
+								"org.freedesktop.DBus.Error.NotSupported",
+								&"GetAll is unsafe",
+							)
+							.await
+							.unwrap();
+					},
+					(PROPERTIES, "Get") => {
+						let (requested, property): (String, String) =
+							message.body().deserialize().unwrap();
+						assert_eq!((requested.as_str(), property.as_str()), (TEXT, "CharacterCount"));
+						calls.push((member.to_owned(), format!("{requested}.{property}")));
+						server.reply(&header, &Value::from(12_i32)).await.unwrap();
+					},
+					(TEXT, "GetText") => {
+						let (start, end): (i32, i32) = message.body().deserialize().unwrap();
+						let result: String = "initial text"
+							.chars()
+							.skip(usize::try_from(start).unwrap())
+							.take(usize::try_from(end - start).unwrap())
+							.collect();
+						server.reply(&header, &result).await.unwrap();
+					},
+					_ => panic!("unexpected AT-SPI call: {interface}.{member}"),
+				}
+			}
+		}
+
+		let rt = Builder::new_current_thread().enable_all().build().unwrap();
+		let (text, calls) = rt.block_on(async {
+			let (client, server) = tokio::net::UnixStream::pair().unwrap();
+			let server = ConnectionBuilder::unix_stream(server)
+				.server(atspi::zbus::Guid::generate())
+				.unwrap()
+				.p2p()
+				.build();
+			let client = ConnectionBuilder::unix_stream(client).p2p().build();
+			let (server, client) = tokio::try_join!(server, client).unwrap();
+			let object = ObjectRefOwned::from_static_str_unchecked(PEER, "/text");
+			let mut calls = Vec::new();
+			let text = tokio::select! {
+				text = text_value(&client, &object) => text,
+				() = app(server, &mut calls) => unreachable!("the app stopped answering"),
+			};
+			(text, calls)
+		});
+
+		assert!(
+			calls.iter().all(|(member, _)| member != "GetAll"),
+			"unsafe property calls: {calls:?}"
+		);
+		assert_eq!(text.as_deref(), Some("initial text"));
+		assert!(
+			calls.iter().any(|(member, property)| member == "Get"
+				&& property == "org.a11y.atspi.Text.CharacterCount")
+		);
+	}
 
 	#[test]
 	fn generic_press_never_selects_an_unrelated_editing_action() {
@@ -1414,6 +2112,28 @@ mod tests {
 		assert_eq!(action_index(actions[..2].iter().copied(), "press"), None);
 		assert_eq!(action_index(actions.into_iter(), "buffer.delete-line"), Some(0));
 		assert_eq!(action_index(std::iter::empty(), "press"), None);
+	}
+
+	/// Machine names in order, as the GTK 3, GTK 4, Qt 5, Qt 6 and Chromium
+	/// 156 matrix fixtures on Ubuntu 22.04 list them (the colour swatch as GTK
+	/// declares it), with the action `action_index` resolves a generic press to.
+	#[test]
+	fn generic_press_takes_each_toolkits_activation() {
+		let cases: [(&str, &[&str], Option<usize>); 10] = [
+			("GTK 4 label", &["clipboard.copy", "link.open", "menu.popup"], None),
+			("Qt slider", &["SetFocus", "Increase", "Decrease"], None),
+			("Qt menu bar item", &["ShowMenu"], None),
+			("Chromium ARIA menu item", &["select", "showContextMenu"], Some(0)),
+			("Chromium tab", &["doDefault", "showContextMenu"], Some(0)),
+			("Chromium section", &["clickAncestor", "showContextMenu"], Some(0)),
+			("GTK colour swatch", &["select", "activate", "customize"], Some(1)),
+			("spaced spelling", &["Do Default"], Some(0)),
+			("hyphenated spelling", &["do-default"], Some(0)),
+			("context menu only", &["showContextMenu"], None),
+		];
+		for (widget, actions, expected) in cases {
+			assert_eq!(action_index(actions.iter().copied(), "press"), expected, "{widget}");
+		}
 	}
 
 	#[test]
@@ -1506,7 +2226,7 @@ mod tests {
 			}
 		}
 
-		/// An error naming what the field reads, one that names no text, or one
+		/// An error naming what the field reads, one that quotes no text, or one
 		/// saying the field was emptied.
 		enum Verdict {
 			Ok,
@@ -1601,7 +2321,12 @@ mod tests {
 				let object = ObjectRefOwned::from_static_str_unchecked(PEER, path);
 				let name = object.name().unwrap().clone();
 				let accessible = object.as_accessible_proxy(&client).await.unwrap();
-				results.push(write_text(&client, &accessible, &name, &object, "new ä€😀").await);
+				let mut emptied = false;
+				results.push(
+					write_text(&client, &accessible, &name, &object, "new ä€😀", &mut emptied)
+						.await
+						.map_err(|error| text_write_error(error, emptied)),
+				);
 			}
 			drop(server);
 			results
@@ -1612,10 +2337,498 @@ mod tests {
 				(Verdict::Ok, Ok(())) => {},
 				(Verdict::Reads(text), Err(err)) if err.message.contains(text) => {},
 				(Verdict::Hidden, Err(err))
-					if err.message.contains("secure") && !err.message.contains("new") => {},
+					if !err.message.contains("new")
+						&& !err.message.contains(r#""old""#)
+						&& !err.message.contains("emptied") => {},
 				(Verdict::Emptied, Err(err))
 					if err.message.contains("emptied") && !err.message.contains("new") => {},
 				(_, result) => panic!("{path}: {result:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn a_numeric_write_the_app_clamps_or_ignores_fails() {
+		use std::sync::{Arc, Mutex};
+
+		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
+
+		/// What a control does with a write: takes it, clamps it to its range
+		/// (GTK, Qt), keeps its old value while answering (Qt), takes it after
+		/// the first read back, or stores it as `float`.
+		#[derive(Clone, Copy)]
+		enum Takes {
+			Exact,
+			Clamped,
+			Ignored,
+			Later,
+			Single,
+		}
+
+		/// `org.a11y.atspi.Value` with optional bounds.
+		struct Value {
+			current: Arc<Mutex<f64>>,
+			pending: Mutex<Option<f64>>,
+			takes:   Takes,
+			bounds:  Option<(f64, f64)>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Value")]
+		impl Value {
+			#[zbus(property)]
+			fn current_value(&self) -> f64 {
+				let current = *self.current.lock().unwrap();
+				// A write the toolkit applies late shows from the second read on.
+				let pending = self.pending.lock().unwrap().take();
+				if let Some(value) = pending {
+					*self.current.lock().unwrap() = value;
+				}
+				current
+			}
+
+			#[zbus(property)]
+			fn set_current_value(&mut self, value: f64) {
+				let mut current = self.current.lock().unwrap();
+				match self.takes {
+					Takes::Exact => *current = value,
+					Takes::Clamped => {
+						let (min, max) = self.bounds.unwrap_or((0.0, 100.0));
+						*current = value.clamp(min, max);
+					},
+					Takes::Ignored => {},
+					Takes::Later => *self.pending.get_mut().unwrap() = Some(value),
+					#[expect(clippy::cast_possible_truncation, reason = "a float-storing toolkit")]
+					Takes::Single => *current = f64::from(value as f32),
+				}
+			}
+
+			#[zbus(property)]
+			fn minimum_value(&self) -> atspi::zbus::fdo::Result<f64> {
+				self.range(|(min, _)| min)
+			}
+
+			#[zbus(property)]
+			fn maximum_value(&self) -> atspi::zbus::fdo::Result<f64> {
+				self.range(|(_, max)| max)
+			}
+		}
+
+		impl Value {
+			fn range(&self, bound: impl FnOnce((f64, f64)) -> f64) -> atspi::zbus::fdo::Result<f64> {
+				self
+					.bounds
+					.map(bound)
+					.ok_or_else(|| atspi::zbus::fdo::Error::Failed("no range".to_owned()))
+			}
+		}
+
+		const PEER: &str = ":1.7";
+		// Path, what the control does, its bounds, the value written,
+		// and the error's text (`None`: the write succeeds).
+		type Case = (&'static str, Takes, Option<(f64, f64)>, f64, Option<&'static str>);
+		let bounded = Some((0.0, 100.0));
+		let cases: [Case; 8] = [
+			("/exact", Takes::Exact, bounded, 37.25, None),
+			("/later", Takes::Later, bounded, 37.0, None),
+			("/single", Takes::Single, bounded, 0.3, None),
+			(
+				"/minimum_only",
+				Takes::Clamped,
+				Some((0.0, f64::MAX)),
+				-1.0,
+				Some("wrote -1; the control now reads 0 (its minimum is 0)."),
+			),
+			(
+				"/maximum_only",
+				Takes::Clamped,
+				Some((-f64::MAX, 100.0)),
+				150.0,
+				Some("wrote 150; the control now reads 100 (its maximum is 100)."),
+			),
+			(
+				"/clamped",
+				Takes::Clamped,
+				bounded,
+				150.0,
+				Some("wrote 150; the control now reads 100 (its maximum is 100)"),
+			),
+			("/ignored", Takes::Ignored, bounded, 37.0, Some("wrote 37; the control now reads 20.")),
+			("/unranged", Takes::Clamped, None, 150.0, Some("wrote 150; the control now reads 100.")),
+		];
+		let rt = Builder::new_current_thread().enable_all().build().unwrap();
+		let results = rt.block_on(async {
+			let (client, server) = tokio::net::UnixStream::pair().unwrap();
+			let mut builder = ConnectionBuilder::unix_stream(server)
+				.server(atspi::zbus::Guid::generate())
+				.unwrap()
+				.p2p();
+			for &(path, takes, bounds, ..) in &cases {
+				let current = Arc::new(Mutex::new(20.0));
+				let control = Value { current, pending: Mutex::new(None), takes, bounds };
+				builder = builder.serve_at(path, control).unwrap();
+			}
+			let client = ConnectionBuilder::unix_stream(client).p2p().build();
+			let (server, client) = tokio::try_join!(builder.build(), client).unwrap();
+			let mut results = Vec::new();
+			for &(path, _, _, value, _) in &cases {
+				let object = ObjectRefOwned::from_static_str_unchecked(PEER, path);
+				let name = object.name().unwrap().clone();
+				results.push(write_value(&client, &name, &object, value).await);
+			}
+			drop(server);
+			results
+		});
+		for ((path, .., error), result) in cases.iter().zip(results) {
+			match (error, result) {
+				(None, Ok(())) => {},
+				(Some(text), Err(err)) if err.message.contains(text) => {},
+				(_, result) => panic!("{path}: {result:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn typed_text_goes_in_where_typing_would_put_it_or_not_at_all() {
+		use std::sync::{Arc, Mutex};
+
+		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
+
+		const PEER: &str = ":1.7";
+
+		/// What a field does with an edit: applies it as GTK 3 does (`length`
+		/// in bytes, caret left where it was), answers true and keeps its text
+		/// (Firefox 160), applies a delete but not the insert after it, or puts
+		/// in something else.
+		#[derive(Clone, Copy, PartialEq)]
+		enum Edits {
+			Applied,
+			Ignored,
+			DeleteOnly,
+			Garbled,
+		}
+
+		struct Field {
+			text:      String,
+			caret:     i32,
+			selection: Option<(i32, i32)>,
+			edits:     Edits,
+			/// How many edits (deletes and inserts) it got.
+			writes:    usize,
+			/// One mask character per character, as a hidden GTK 4 entry.
+			hidden:    bool,
+		}
+
+		type Shared = Arc<Mutex<Field>>;
+
+		struct Text(Shared);
+
+		#[interface(name = "org.a11y.atspi.Text")]
+		impl Text {
+			#[zbus(property)]
+			fn character_count(&self) -> i32 {
+				self.0.lock().unwrap().text.chars().count() as i32
+			}
+
+			#[zbus(property)]
+			fn caret_offset(&self) -> i32 {
+				self.0.lock().unwrap().caret
+			}
+
+			fn get_text(&self, start: i32, end: i32) -> String {
+				let field = self.0.lock().unwrap();
+				let text = field
+					.text
+					.chars()
+					.skip(start as usize)
+					.take((end - start) as usize);
+				if field.hidden {
+					text.map(|_| '●').collect()
+				} else {
+					text.collect()
+				}
+			}
+
+			fn get_n_selections(&self) -> i32 {
+				i32::from(self.0.lock().unwrap().selection.is_some())
+			}
+
+			#[zbus(out_args("start_offset", "end_offset"))]
+			fn get_selection(&self, selection_num: i32) -> (i32, i32) {
+				assert_eq!(selection_num, 0, "only the first selection is read");
+				self.0.lock().unwrap().selection.unwrap_or_default()
+			}
+
+			fn set_caret_offset(&self, offset: i32) -> bool {
+				self.0.lock().unwrap().caret = offset;
+				true
+			}
+		}
+
+		struct Editable(Shared);
+
+		#[interface(name = "org.a11y.atspi.EditableText")]
+		impl Editable {
+			fn delete_text(&self, start: i32, end: i32) -> bool {
+				let mut field = self.0.lock().unwrap();
+				field.writes += 1;
+				if field.edits != Edits::Ignored {
+					let kept: String = field.text.chars().take(start as usize).collect();
+					let rest: String = field.text.chars().skip(end as usize).collect();
+					field.text = kept + &rest;
+					field.selection = None;
+				}
+				true
+			}
+
+			fn insert_text(&self, position: i32, text: String, length: i32) -> bool {
+				let mut field = self.0.lock().unwrap();
+				field.writes += 1;
+				let inserted = match field.edits {
+					Edits::Applied => text[..length as usize].to_owned(),
+					Edits::Ignored | Edits::DeleteOnly => return true,
+					Edits::Garbled => format!("{text}?"),
+				};
+				let kept: String = field.text.chars().take(position as usize).collect();
+				let rest: String = field.text.chars().skip(position as usize).collect();
+				field.text = kept + &inserted + &rest;
+				true
+			}
+		}
+
+		struct Accessible {
+			/// `None`: the role cannot be read.
+			role:     Option<Role>,
+			editable: bool,
+			states:   StateSet,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Accessible {
+			fn get_role(&self) -> atspi::zbus::fdo::Result<u32> {
+				self
+					.role
+					.map(|role| role as u32)
+					.ok_or_else(|| atspi::zbus::fdo::Error::Failed("no role".into()))
+			}
+
+			fn get_state(&self) -> Vec<u32> {
+				let bits = self.states.bits();
+				vec![bits as u32, (bits >> 32) as u32]
+			}
+
+			fn get_interfaces(&self) -> Vec<String> {
+				let mut names = vec!["org.a11y.atspi.Accessible", "org.a11y.atspi.Text"];
+				if self.editable {
+					names.push("org.a11y.atspi.EditableText");
+				}
+				names.into_iter().map(str::to_owned).collect()
+			}
+		}
+
+		/// The outcome: taken, and the field's text and caret afterward; not
+		/// taken (keys may follow), or declined with a reason; or an error
+		/// naming what the field reads.
+		#[derive(Debug, PartialEq)]
+		enum Outcome {
+			Taken(&'static str, i32),
+			NotTaken,
+			Declined,
+			Reads(&'static str),
+		}
+
+		struct Case {
+			path:      &'static str,
+			text:      &'static str,
+			old:       &'static str,
+			caret:     i32,
+			selection: Option<(i32, i32)>,
+			edits:     Edits,
+			role:      Option<Role>,
+			editable:  bool,
+			states:    StateSet,
+			hidden:    bool,
+			toolkit:   &'static str,
+			outcome:   Outcome,
+			writes:    usize,
+		}
+
+		let field = |path, old, caret, outcome, writes| Case {
+			path,
+			text: "AB",
+			old,
+			caret,
+			selection: None,
+			edits: Edits::Applied,
+			role: Some(Role::Entry),
+			editable: true,
+			// GTK 4 reports `Sensitive` without `Enabled`. Focused, so the
+			// caret and selection count.
+			states: StateSet::new(State::Editable | State::Sensitive | State::Focused),
+			hidden: false,
+			toolkit: "gtk",
+			outcome,
+			writes,
+		};
+		let cases = [
+			field("/caret", "hello", 2, Outcome::Taken("heABllo", 4), 1),
+			// Select-on-focus can be off: do not delete an unfocused entry's
+			// text without evidence that its whole value is selected.
+			Case {
+				states: StateSet::new(State::Editable | State::Sensitive),
+				..field("/unfocused_entry", "hello", 2, Outcome::Declined, 0)
+			},
+			// Both setting values agree for a full selection or an empty value.
+			Case {
+				states: StateSet::new(State::Editable | State::Sensitive),
+				selection: Some((5, 0)),
+				..field("/unfocused_selected", "hello", 0, Outcome::Taken("AB", 2), 2)
+			},
+			Case {
+				states: StateSet::new(State::Editable | State::Sensitive),
+				..field("/unfocused_empty", "", 0, Outcome::Taken("AB", 2), 1)
+			},
+			// A text view keeps its caret when focused.
+			Case {
+				states: StateSet::new(State::Editable | State::Sensitive | State::MultiLine),
+				..field("/unfocused_text_view", "hello", 2, Outcome::Taken("heABllo", 4), 1)
+			},
+			// LibreOffice reports `-1` for a paragraph without the caret.
+			field("/no_caret", "hello", -1, Outcome::NotTaken, 0),
+			Case {
+				selection: Some((6, 11)),
+				..field("/selection", "hello world", 3, Outcome::Taken("hello AB", 8), 2)
+			},
+			// A selection made from its end backward.
+			Case {
+				selection: Some((11, 6)),
+				..field("/backward", "hello world", 3, Outcome::Taken("hello AB", 8), 2)
+			},
+			Case { edits: Edits::Ignored, ..field("/gecko", "hello", 5, Outcome::NotTaken, 1) },
+			// The read-back repeats the written text, which an error never quotes.
+			Case {
+				edits: Edits::Garbled,
+				..field(
+					"/garbled",
+					"hello",
+					5,
+					Outcome::Reads(r#"now reads "hello<the written text>?""#),
+					1,
+				)
+			},
+			// The selection went, the text did not: the field changed.
+			Case {
+				selection: Some((6, 11)),
+				edits: Edits::DeleteOnly,
+				..field("/delete_only", "hello world", 3, Outcome::Reads(r#"now reads "hello ""#), 2)
+			},
+			// No edit interface (Chromium): nothing is tried.
+			Case { editable: false, ..field("/chromium", "hello", 5, Outcome::NotTaken, 0) },
+			// Qt's line edit would take an insert typing could not make.
+			Case {
+				states: StateSet::new(State::Editable | State::Sensitive | State::ReadOnly),
+				..field("/read_only", "hello", 5, Outcome::NotTaken, 0)
+			},
+			Case {
+				states: StateSet::new(State::Editable),
+				..field("/disabled", "hello", 5, Outcome::NotTaken, 0)
+			},
+			Case { role: Some(Role::PasswordText), ..field("/password", "", 0, Outcome::NotTaken, 0) },
+			Case { role: None, ..field("/no_role", "hello", 5, Outcome::NotTaken, 0) },
+			// A hidden field takes the text; its mask shows as many characters.
+			Case { hidden: true, ..field("/hidden", "", 0, Outcome::Taken("●●", 2), 1) },
+			// A hidden field that already holds text hides where its caret is.
+			Case { hidden: true, ..field("/hidden_text", "pw", 2, Outcome::NotTaken, 0) },
+			// Qt counts offsets in UTF-16 units, GTK in characters.
+			field("/astral", "😀x", 2, Outcome::NotTaken, 0),
+			// Lengths are bytes in GTK 3 and UTF-16 units in Qt.
+			Case { text: "é", ..field("/accented", "hello", 5, Outcome::NotTaken, 0) },
+			// Return is a key that acts, not text.
+			Case { text: "a\n", ..field("/newline", "hello", 5, Outcome::NotTaken, 0) },
+			Case { text: "", ..field("/empty", "hello", 5, Outcome::NotTaken, 0) },
+			// A Qt line edit applies the insert as `setText`, past its validator:
+			// a digits-only field would hold "AB" after a reported success.
+			Case { toolkit: "Qt", ..field("/qt_line_edit", "12", 2, Outcome::Declined, 0) },
+			// A toolkit whose insert was never measured, or one the application
+			// does not name, keeps keys: a Qt line edit read as unnamed would
+			// otherwise take `setText` and report success.
+			Case { toolkit: "", ..field("/unnamed_toolkit", "12", 2, Outcome::NotTaken, 0) },
+			Case { toolkit: "VCL", ..field("/other_toolkit", "12", 2, Outcome::NotTaken, 0) },
+			// A Qt multi-line edit inserts through a text cursor, as typing does.
+			Case {
+				toolkit: "Qt",
+				states: StateSet::new(State::Editable | State::Enabled | State::MultiLine),
+				..field("/qt_text_edit", "12", 2, Outcome::Taken("12AB", 4), 1)
+			},
+		];
+		let fields: Vec<Shared> = cases
+			.iter()
+			.map(|case| {
+				Arc::new(Mutex::new(Field {
+					text:      case.old.to_owned(),
+					caret:     case.caret,
+					selection: case.selection,
+					edits:     case.edits,
+					writes:    0,
+					hidden:    case.hidden,
+				}))
+			})
+			.collect();
+		let rt = Builder::new_current_thread().enable_all().build().unwrap();
+		let results = rt.block_on(async {
+			let (client, server) = tokio::net::UnixStream::pair().unwrap();
+			let mut builder = ConnectionBuilder::unix_stream(server)
+				.server(atspi::zbus::Guid::generate())
+				.unwrap()
+				.p2p();
+			for (case, field) in cases.iter().zip(&fields) {
+				builder = builder
+					.serve_at(case.path, Text(field.clone()))
+					.unwrap()
+					.serve_at(case.path, Editable(field.clone()))
+					.unwrap()
+					.serve_at(case.path, Accessible {
+						role:     case.role,
+						editable: case.editable,
+						states:   case.states,
+					})
+					.unwrap();
+			}
+			let client = ConnectionBuilder::unix_stream(client).p2p().build();
+			let (server, client) = tokio::try_join!(builder.build(), client).unwrap();
+			let mut results = Vec::new();
+			for case in &cases {
+				let object = ObjectRefOwned::from_static_str_unchecked(PEER, case.path);
+				let name = object.name().unwrap().clone();
+				let accessible = object.as_accessible_proxy(&client).await.unwrap();
+				results.push(
+					insert_typed_text(&client, &accessible, &name, &object, case.toolkit, case.text)
+						.await,
+				);
+			}
+			drop(server);
+			results
+		});
+		for ((case, result), field) in cases.iter().zip(results).zip(&fields) {
+			let field = field.lock().unwrap();
+			assert_eq!(field.writes, case.writes, "{}: edits", case.path);
+			match (&case.outcome, result) {
+				(Outcome::Taken(text, caret), Ok(TextRoute::Inserted)) => {
+					let shown = if field.hidden {
+						"●".repeat(field.text.chars().count())
+					} else {
+						field.text.clone()
+					};
+					assert_eq!((shown.as_str(), field.caret), (*text, *caret), "{}", case.path);
+				},
+				(Outcome::NotTaken, Ok(TextRoute::Absent)) => {
+					assert_eq!(field.text, case.old, "{}: text changed", case.path);
+				},
+				(Outcome::Declined, Ok(TextRoute::Declined(reason))) => {
+					assert_eq!(field.text, case.old, "{}: text changed", case.path);
+					assert!(!reason.is_empty(), "{}: missing decline reason", case.path);
+				},
+				(Outcome::Reads(text), Err(err)) if err.message.contains(text) => {},
+				(outcome, result) => panic!("{}: expected {outcome:?}, got {result:?}", case.path),
 			}
 		}
 	}
@@ -1670,39 +2883,72 @@ mod tests {
 		// GNOME: gnome-shell (the compositor, pid 1) keeps its "Main stage"
 		// active.
 		let mut gnome = vec![frame("Main stage", 1, true), frame("notes.txt - gedit", 7, true)];
-		resolve_focus(&mut gnome, Some(1), no_lookup);
+		resolve_focus(&mut gnome, Some(1), false, no_lookup);
 		assert_eq!(focused(&gnome), ["notes.txt - gedit"]);
 
 		// KDE: plasma-keyboard's untitled frame stays active.
 		let mut kde = vec![frame("", 5, true), frame("notes.txt — Kate", 8, true)];
-		resolve_focus(&mut kde, None, no_lookup);
+		resolve_focus(&mut kde, None, false, no_lookup);
 		assert_eq!(focused(&kde), ["notes.txt — Kate"]);
 
 		// The GNOME overview: only the shell is active, and it keeps focus.
 		let mut overview = vec![frame("Main stage", 1, true), frame("notes.txt - gedit", 7, false)];
-		resolve_focus(&mut overview, Some(1), no_lookup);
+		resolve_focus(&mut overview, Some(1), false, no_lookup);
 		assert_eq!(focused(&overview), ["Main stage"]);
 
 		// Two active application windows: none is named.
 		let mut two = vec![frame("Main stage", 1, true), frame("A", 7, true), frame("B", 9, true)];
-		resolve_focus(&mut two, Some(1), no_lookup);
+		resolve_focus(&mut two, Some(1), false, no_lookup);
 		assert!(focused(&two).is_empty());
 
 		// An untitled application window still wins over gnome-shell's frame.
 		let mut untitled = vec![frame("Main stage", 1, true), frame("", 7, true)];
-		resolve_focus(&mut untitled, Some(1), no_lookup);
+		resolve_focus(&mut untitled, Some(1), false, no_lookup);
 		assert_eq!(focused(&untitled), [""]);
 
 		// KDE with an untitled app beside plasma-keyboard: the frame holding
 		// keyboard focus wins.
 		let mut kde_untitled = vec![frame("", 5, true), frame("", 8, true)];
-		resolve_focus(&mut kde_untitled, None, |window| window.pid == Some(8));
+		resolve_focus(&mut kde_untitled, None, false, |window| window.pid == Some(8));
 		let ids: Vec<&str> = kde_untitled
 			.iter()
 			.filter(|w| w.window.focused)
 			.map(|w| w.window.id.as_str())
 			.collect();
 		assert_eq!(ids, ["-8"]);
+
+		// A shell's permanent Active state cannot stand in for a skipped app.
+		let mut skipped_gnome = vec![frame("Main stage", 1, true)];
+		resolve_focus(&mut skipped_gnome, Some(1), true, |_| false);
+		assert!(focused(&skipped_gnome).is_empty());
+		let mut skipped_kde = vec![frame("", 5, true)];
+		resolve_focus(&mut skipped_kde, None, true, |_| false);
+		assert!(focused(&skipped_kde).is_empty());
+
+		// Positive keyboard focus still permits the overview or an untitled app.
+		let mut focused_overview = vec![frame("Main stage", 1, true)];
+		resolve_focus(&mut focused_overview, Some(1), true, |_| true);
+		assert_eq!(focused(&focused_overview), ["Main stage"]);
+		let mut focused_untitled = vec![frame("", 8, true)];
+		resolve_focus(&mut focused_untitled, None, true, |_| true);
+		assert_eq!(focused(&focused_untitled), [""]);
+
+		// A named application's Active state does not require a shell probe.
+		let mut answered_app = vec![frame("notes.txt", 7, true)];
+		resolve_focus(&mut answered_app, Some(1), true, no_lookup);
+		assert_eq!(focused(&answered_app), ["notes.txt"]);
+
+		// An all-untitled tie already proves keyboard focus, so do not scan
+		// twice.
+		let mut checked_kde = vec![frame("", 5, true), frame("", 8, true)];
+		let mut probes = 0;
+		resolve_focus(&mut checked_kde, None, true, |window| {
+			probes += 1;
+			window.pid == Some(8)
+		});
+		assert!(!checked_kde[0].window.focused);
+		assert!(checked_kde[1].window.focused);
+		assert_eq!(probes, 2);
 	}
 
 	#[test]
@@ -1765,11 +3011,11 @@ mod tests {
 			let (server, client) = tokio::try_join!(server.build(), client).unwrap();
 			let object = |path| ObjectRefOwned::from_static_str_unchecked(PEER, path);
 			let path = |object: ObjectRefOwned| object.path_as_str().to_owned();
-			let top_levels = AtSpiAx::top_levels(&client, &object("/app")).await;
+			let top_levels = AtSpiAx::frames(&client, &object("/app"), REPLY_TIMEOUT).await;
 			let mut owners = Vec::new();
 			for element in ["/open", "/dialog", "/ok"] {
 				owners.push(
-					AtSpiAx::top_level(&client, object(element))
+					AtSpiAx::top_level(&client, object(element), REPLY_TIMEOUT)
 						.await
 						.map(path)
 						.ok(),
@@ -1778,7 +3024,7 @@ mod tests {
 			drop(server);
 			(top_levels.map(|items| items.into_iter().map(path).collect::<Vec<_>>()), owners)
 		});
-		assert_eq!(top_levels, Ok(vec!["/dialog".to_owned(), "/frame".to_owned()]));
+		assert_eq!(top_levels.unwrap(), vec!["/dialog".to_owned(), "/frame".to_owned()]);
 		assert_eq!(owners, [Some("/dialog".into()), Some("/dialog".into()), Some("/frame".into())]);
 	}
 
@@ -1797,12 +3043,17 @@ mod tests {
 
 		#[interface(name = "org.a11y.atspi.Accessible")]
 		impl Node {
+			#[zbus(property)]
+			fn child_count(&self) -> i32 {
+				self.children.len() as i32
+			}
+
 			fn get_state(&self) -> Vec<u32> {
 				self.state.clone()
 			}
 
-			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
-				self.children.clone()
+			fn get_child_at_index(&self, index: i32) -> (String, OwnedObjectPath) {
+				self.children[index as usize].clone()
 			}
 		}
 
@@ -1836,7 +3087,7 @@ mod tests {
 			let client = ConnectionBuilder::unix_stream(client).p2p().build();
 			let (server, client) = tokio::try_join!(server, client).unwrap();
 			let root = ObjectRefOwned::from_static_str_unchecked(PEER, "/root");
-			let found = AtSpiAx::find_focused(&client, root, 0).await;
+			let found = AtSpiAx::find_focused(&client, root, 0, REPLY_TIMEOUT).await;
 			drop(server);
 			found
 		});
@@ -1847,6 +3098,247 @@ mod tests {
 				.as_deref(),
 			Some("/focus")
 		);
+	}
+
+	mod long_lists {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicU32, Ordering},
+		};
+
+		use atspi::zbus::{
+			Connection, connection::Builder as ConnectionBuilder, fdo, interface,
+			zvariant::OwnedObjectPath,
+		};
+
+		use super::*;
+
+		const PEER: &str = ":1.7";
+
+		/// A table that reports a million children, as Qt does for a
+		/// 250,000-row `QTableView`, and counts each request for all of them.
+		struct Table {
+			whole_reads: Arc<AtomicU32>,
+			/// The child that holds focus.
+			focused_at:  i32,
+			/// Whether it fails every request for one child.
+			refuses:     bool,
+			failed_at:   Option<i32>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Table {
+			#[allow(clippy::unused_self, reason = "the fake table's count is fixed")]
+			#[zbus(property)]
+			fn child_count(&self) -> i32 {
+				1_000_000
+			}
+
+			#[allow(clippy::unused_self, reason = "the fake table is never focused")]
+			fn get_state(&self) -> Vec<u32> {
+				vec![0, 0]
+			}
+
+			fn get_children(&self) -> fdo::Result<Vec<(String, OwnedObjectPath)>> {
+				self.whole_reads.fetch_add(1, Ordering::SeqCst);
+				Err(fdo::Error::LimitsExceeded("a million children".into()))
+			}
+
+			fn get_child_at_index(&self, index: i32) -> fdo::Result<(String, OwnedObjectPath)> {
+				if self.refuses || self.failed_at == Some(index) {
+					return Err(fdo::Error::Failed("no such child".into()));
+				}
+				let path = if index == self.focused_at {
+					"/focus"
+				} else {
+					"/cell"
+				};
+				Ok((PEER.to_owned(), OwnedObjectPath::try_from(path).unwrap()))
+			}
+		}
+
+		struct Cell {
+			count_reads: Arc<AtomicU32>,
+			state:       Vec<u32>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Cell {
+			#[allow(clippy::unused_self, reason = "fake cells have no children")]
+			#[zbus(property)]
+			fn child_count(&self) -> i32 {
+				self.count_reads.fetch_add(1, Ordering::SeqCst);
+				0
+			}
+
+			fn get_state(&self) -> Vec<u32> {
+				self.state.clone()
+			}
+
+			#[allow(clippy::unused_self, reason = "fake cells have no children")]
+			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				Vec::new()
+			}
+		}
+
+		/// Runs `check` against a client connected to an app serving the
+		/// table at `/table`, one that answers no request for a child at
+		/// `/refusing`, a plain cell at `/cell` and a focused cell at `/focus`;
+		/// returns its result and how often a table was asked for all of its
+		/// children.
+		fn with_table<T>(check: impl AsyncFnOnce(&Connection) -> T) -> (T, u32) {
+			let focused = State::Focused as u64;
+			let whole_reads = Arc::new(AtomicU32::new(0));
+			let rt = Builder::new_current_thread().enable_all().build().unwrap();
+			let result = rt.block_on(async {
+				let (client, server) = tokio::net::UnixStream::pair().unwrap();
+				let table = Table {
+					whole_reads: whole_reads.clone(),
+					focused_at:  2,
+					refuses:     false,
+					failed_at:   None,
+				};
+				let refusing = Table {
+					whole_reads: whole_reads.clone(),
+					focused_at:  -1,
+					refuses:     true,
+					failed_at:   None,
+				};
+				let partial = Table {
+					whole_reads: whole_reads.clone(),
+					focused_at:  -1,
+					refuses:     false,
+					failed_at:   Some(1),
+				};
+				let server = ConnectionBuilder::unix_stream(server)
+					.server(atspi::zbus::Guid::generate())
+					.unwrap()
+					.p2p()
+					.serve_at("/table", table)
+					.unwrap()
+					.serve_at("/refusing", refusing)
+					.unwrap()
+					.serve_at("/cell", Cell {
+						count_reads: Arc::new(AtomicU32::new(0)),
+						state:       vec![0, 0],
+					})
+					.unwrap()
+					.serve_at("/partial", partial)
+					.unwrap()
+					.serve_at("/focus", Cell {
+						count_reads: whole_reads.clone(),
+						state:       vec![focused as u32, (focused >> 32) as u32],
+					})
+					.unwrap()
+					.build();
+				let client = ConnectionBuilder::unix_stream(client).p2p().build();
+				let (server, client) = tokio::try_join!(server, client).unwrap();
+				let result = check(&client).await;
+				drop(server);
+				result
+			});
+			(result, whole_reads.load(Ordering::SeqCst))
+		}
+
+		/// Proxy for `path`'s accessible and its child count.
+		async fn table(
+			client: &Connection,
+			path: &'static str,
+		) -> (atspi::proxy::accessible::AccessibleProxy<'static>, u32) {
+			let proxy = atspi::proxy::accessible::AccessibleProxy::builder(client)
+				.destination(PEER)
+				.unwrap()
+				.path(path)
+				.unwrap()
+				.cache_properties(atspi::zbus::proxy::CacheProperties::No)
+				.build()
+				.await
+				.unwrap();
+			let count = proxy.child_count().await.unwrap() as u32;
+			(proxy, count)
+		}
+
+		#[test]
+		fn an_unknown_child_count_leaves_children_unread_without_asking_for_all() {
+			let ((children, unread), whole_reads) = with_table(async |client| {
+				let (proxy, _) = table(client, "/table").await;
+				children_of(&proxy, None, 800).await.unwrap()
+			});
+			assert!(children.is_empty());
+			assert_eq!(unread, u32::MAX);
+			assert_eq!(whole_reads, 0);
+		}
+
+		#[test]
+		fn a_small_stale_count_never_requests_all_children_or_exceeds_the_budget() {
+			let ((children, unread), whole_reads) = with_table(async |client| {
+				let (proxy, _) = table(client, "/table").await;
+				children_of(&proxy, Some(4), 2).await.unwrap()
+			});
+			assert_eq!((children.len(), unread, whole_reads), (2, 2, 0));
+		}
+
+		#[test]
+		fn a_focused_root_does_not_read_its_child_count() {
+			let (found, count_reads) = with_table(async |client| {
+				AtSpiAx::find_focused(
+					client,
+					ObjectRefOwned::from_static_str_unchecked(PEER, "/focus"),
+					0,
+					Duration::from_secs(1),
+				)
+				.await
+				.unwrap()
+			});
+			assert!(found.is_some());
+			assert_eq!(count_reads, 0);
+		}
+
+		#[test]
+		fn a_failed_index_is_counted_as_unread() {
+			let ((children, unread), whole_reads) = with_table(async |client| {
+				let (proxy, count) = table(client, "/partial").await;
+				children_of(&proxy, Some(count), 3).await.unwrap()
+			});
+			assert_eq!((children.len(), unread, whole_reads), (2, 999_998, 0));
+		}
+
+		#[test]
+		fn a_long_list_is_read_by_index_up_to_the_limit() {
+			let ((children, unread), whole_reads) = with_table(async |client| {
+				let (proxy, count) = table(client, "/table").await;
+				children_of(&proxy, Some(count), 6_000).await.unwrap()
+			});
+			assert_eq!((children.len(), unread, whole_reads), (6_000, 994_000, 0));
+		}
+
+		#[test]
+		fn a_long_list_that_answers_no_child_fails_the_read() {
+			let (read, whole_reads) = with_table(async |client| {
+				let (proxy, count) = table(client, "/refusing").await;
+				children_of(&proxy, Some(count), 800).await
+			});
+			assert!(read.is_err(), "{read:?}");
+			assert_eq!(whole_reads, 0);
+		}
+
+		#[test]
+		fn the_focused_search_finds_a_cell_of_a_long_table_without_reading_it_whole() {
+			let (found, whole_reads) = with_table(async |client| {
+				let table = ObjectRefOwned::from_static_str_unchecked(PEER, "/table");
+				AtSpiAx::find_focused(client, table, 0, REPLY_TIMEOUT).await
+			});
+			let found = found.expect("the focused search must not fail");
+			assert_eq!(
+				(
+					found
+						.map(|object| object.path_as_str().to_owned())
+						.as_deref(),
+					whole_reads
+				),
+				(Some("/focus"), 0)
+			);
+		}
 	}
 
 	#[test]
@@ -1908,8 +3400,8 @@ mod tests {
 		];
 		const PEER: &str = ":1.7";
 
-		/// Answers like the apps, `GetAll` refused as Qt refuses it, so a proxy
-		/// that caches properties cannot read `NActions`.
+		/// Rejects `GetAll` rather than emulating Qt 5's crash. A proxy that
+		/// caches properties therefore cannot read `NActions`.
 		async fn app(server: atspi::zbus::Connection) {
 			let mut stream = MessageStream::from(&server);
 			while let Some(Ok(message)) = stream.next().await {
@@ -2375,7 +3867,7 @@ mod tests {
 			for (path, placement, x, y) in
 				[("/frame", claims[0].flatten(), 390, 460), ("/editor", None, 20, 15)]
 			{
-				let element = AtSpiAx::descend(&client, object(path), placement, x, y)
+				let element = AtSpiAx::descend(&client, object(path), placement, x, y, REPLY_TIMEOUT)
 					.await
 					.unwrap();
 				found.push(element.map(|element| AtSpiAx::object(&element).path_as_str().to_owned()));
@@ -2395,5 +3887,972 @@ mod tests {
 			Some(Some(shown)),
 		]);
 		assert_eq!(found, [Some("/downloads".to_owned()), Some("/open".to_owned())]);
+	}
+
+	mod unanswered {
+		use std::sync::{Arc, Mutex};
+
+		use atspi::zbus::{
+			Guid, connection::Builder as ConnectionBuilder, interface, zvariant::OwnedObjectPath,
+		};
+
+		use super::*;
+		use crate::desktop::control;
+
+		const PEER: &str = ":1.7";
+		/// Long enough for every call this process answers itself.
+		const HUNG_CALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+		fn path(p: &str) -> OwnedObjectPath {
+			OwnedObjectPath::try_from(p).unwrap()
+		}
+
+		/// The backend over a peer-to-peer connection to what `serve` serves.
+		fn backend(
+			reply_timeout: Duration,
+			serve: impl FnOnce(ConnectionBuilder<'static>) -> ConnectionBuilder<'static>,
+		) -> (AtSpiAx, Connection) {
+			let rt = Builder::new_current_thread().enable_all().build().unwrap();
+			let (server, connection) = rt.block_on(async {
+				let (client, server) = tokio::net::UnixStream::pair().unwrap();
+				let server = ConnectionBuilder::unix_stream(server)
+					.server(Guid::generate())
+					.unwrap()
+					.p2p();
+				let client = ConnectionBuilder::unix_stream(client).p2p().build();
+				tokio::try_join!(serve(server).build(), client).unwrap()
+			});
+			(
+				AtSpiAx { rt, connection, reply_timeout, native: None, frames: FrameCache::default() },
+				server,
+			)
+		}
+
+		/// An element of an application that answers no method call, as a GTK 3
+		/// app does while a dialog an accessibility action opened is up. (It
+		/// has no properties: the server answers those inline, so a property
+		/// that never answers would silence every other element too.)
+		struct Silent {
+			/// Cancelled when the first call arrives, as the host cancels a run
+			/// that times out.
+			cancel: Option<control::CancellationSource>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Silent {
+			async fn get_role_name(&self) -> String {
+				if let Some(cancel) = &self.cancel {
+					cancel.cancel();
+				}
+				std::future::pending().await
+			}
+
+			async fn get_state(&self) -> Vec<u32> {
+				std::future::pending().await
+			}
+
+			async fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				std::future::pending().await
+			}
+		}
+
+		struct Element {
+			delay:    Duration,
+			name:     &'static str,
+			role:     Role,
+			focused:  bool,
+			children: Vec<(String, OwnedObjectPath)>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Element {
+			#[zbus(property)]
+			fn child_count(&self) -> i32 {
+				self.children.len() as i32
+			}
+
+			#[zbus(property)]
+			fn name(&self) -> String {
+				self.name.to_owned()
+			}
+
+			async fn get_role(&self) -> u32 {
+				tokio::time::sleep(self.delay).await;
+				self.role as u32
+			}
+
+			async fn get_state(&self) -> Vec<u32> {
+				tokio::time::sleep(self.delay).await;
+				let state = if self.focused {
+					State::Focused as u64
+				} else {
+					0
+				};
+				vec![state as u32, (state >> 32) as u32]
+			}
+
+			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				self.children.clone()
+			}
+
+			fn get_child_at_index(&self, index: i32) -> (String, OwnedObjectPath) {
+				self.children[index as usize].clone()
+			}
+		}
+
+		/// A frame at `(x, y)` on screen, and at the origin in window
+		/// coordinates.
+		struct Extents {
+			x:     i32,
+			y:     i32,
+			delay: Duration,
+		}
+
+		#[interface(name = "org.a11y.atspi.Component")]
+		impl Extents {
+			async fn get_extents(&self, coord_type: u32) -> (i32, i32, i32, i32) {
+				tokio::time::sleep(self.delay).await;
+				if coord_type == CoordType::Window as u32 {
+					(0, 0, 300, 200)
+				} else {
+					(self.x, self.y, 300, 200)
+				}
+			}
+		}
+
+		fn silent_element(
+			reply_timeout: Duration,
+			cancel: Option<control::CancellationSource>,
+		) -> (AtSpiAx, Connection) {
+			backend(reply_timeout, |server| server.serve_at("/silent", Silent { cancel }).unwrap())
+		}
+
+		#[test]
+		fn a_request_the_application_never_answers_times_out() {
+			let (mut ax, _server) = silent_element(HUNG_CALL_TIMEOUT, None);
+			let element = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/silent"));
+			assert_eq!(ax.props(&element).unwrap_err().code, ErrorCode::Timeout);
+		}
+
+		#[test]
+		fn a_cancel_frees_a_request_the_application_never_answers() {
+			let source = control::CancellationSource::default();
+			let (mut ax, _server) = silent_element(REPLY_TIMEOUT, Some(source.clone()));
+			let element = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/silent"));
+			let error =
+				control::with_token_for_test(&source.token(), || ax.props(&element)).unwrap_err();
+			assert_eq!(error.code, ErrorCode::Cancelled);
+		}
+
+		#[test]
+		fn interrupted_masked_text_write_warns_if_the_field_may_be_empty() {
+			use std::sync::{Arc, Mutex};
+
+			struct Accessible([&'static str; 2]);
+			#[interface(name = "org.a11y.atspi.Accessible")]
+			impl Accessible {
+				fn get_interfaces(&self) -> &[&str] {
+					&self.0
+				}
+			}
+
+			struct Text(Arc<Mutex<String>>);
+			#[interface(name = "org.a11y.atspi.Text")]
+			impl Text {
+				#[zbus(property)]
+				fn character_count(&self) -> i32 {
+					self.0.lock().unwrap().chars().count() as i32
+				}
+
+				fn get_text(&self, start_offset: i32, end_offset: i32) -> String {
+					std::iter::repeat_n('●', self.0.lock().unwrap().chars().count())
+						.skip(start_offset as usize)
+						.take((end_offset - start_offset) as usize)
+						.collect()
+				}
+			}
+
+			struct Editable {
+				text:    Arc<Mutex<String>>,
+				count:   Mutex<usize>,
+				stop_at: usize,
+				cancel:  Option<control::CancellationSource>,
+			}
+			#[interface(name = "org.a11y.atspi.EditableText")]
+			impl Editable {
+				async fn set_text_contents(&self, text: String) -> bool {
+					let count = {
+						let mut count = self.count.lock().unwrap();
+						*count += 1;
+						*count
+					};
+					if count == self.stop_at {
+						if let Some(cancel) = &self.cancel {
+							cancel.cancel();
+						}
+						return std::future::pending().await;
+					}
+					*self.text.lock().unwrap() = text;
+					true
+				}
+			}
+
+			// Before any clear, during the clear, and during the rewrite.
+			for stop_at in 1..=3 {
+				for cancelled in [false, true] {
+					let source = control::CancellationSource::default();
+					let text = Arc::new(Mutex::new("old secret".to_owned()));
+					let (mut ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+						server
+							.serve_at(
+								"/password",
+								Accessible(["org.a11y.atspi.EditableText", "org.a11y.atspi.Text"]),
+							)
+							.unwrap()
+							.serve_at("/password", Text(text.clone()))
+							.unwrap()
+							.serve_at("/password", Editable {
+								text: text.clone(),
+								count: Mutex::new(0),
+								stop_at,
+								cancel: cancelled.then(|| source.clone()),
+							})
+							.unwrap()
+					});
+					let element =
+						AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/password"));
+					let error = control::with_token_for_test(&source.token(), || {
+						ax.set_value(&element, "new secret")
+					})
+					.unwrap_err();
+					assert_eq!(
+						error.code,
+						if cancelled {
+							ErrorCode::Cancelled
+						} else {
+							ErrorCode::Timeout
+						}
+					);
+					assert_eq!(
+						error.message.contains("may now be empty"),
+						stop_at == 3,
+						"stop_at={stop_at}, cancelled={cancelled}: {error:?}"
+					);
+					assert!(!error.message.contains("old secret"));
+					assert!(!error.message.contains("new secret"));
+					if stop_at == 3 {
+						assert!(text.lock().unwrap().is_empty());
+					}
+				}
+			}
+		}
+
+		/// A desktop of two applications: one that answers nothing on bus
+		/// `:1.8`, listed first, and an editor whose document frame, at
+		/// `(10, 20)` on screen, has the focus when `focused`. (A peer-to-peer
+		/// connection ignores the destination, so this process serves both.)
+		fn desktop(focused: bool) -> (AtSpiAx, Connection) {
+			desktop_with_delay(focused, Duration::ZERO)
+		}
+
+		fn desktop_with_delay(focused: bool, delay: Duration) -> (AtSpiAx, Connection) {
+			backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![
+							(":1.8".to_owned(), path("/silent")),
+							(PEER.to_owned(), path("/editor")),
+						],
+					})
+					.unwrap()
+					.serve_at("/silent", Silent { cancel: None })
+					.unwrap()
+					.serve_at("/editor", Element {
+						delay:    Duration::ZERO,
+						name:     "Editor",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor/frame"))],
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Element {
+						delay: Duration::ZERO,
+						name: "Document",
+						role: Role::Frame,
+						focused,
+						children: Vec::new(),
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Extents { x: 10, y: 20, delay })
+					.unwrap()
+			})
+		}
+
+		fn slow_tree() -> (AtSpiAx, Connection, DesktopWindow) {
+			let (ax, server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor"))],
+					})
+					.unwrap()
+					.serve_at("/editor", Element {
+						delay:    Duration::ZERO,
+						name:     "Editor",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![
+							(PEER.to_owned(), path("/editor/frame")),
+							(PEER.to_owned(), path("/editor/other")),
+						],
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Element {
+						delay:    Duration::from_millis(600),
+						name:     "",
+						role:     Role::Frame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor/frame/entry"))],
+					})
+					.unwrap()
+					.serve_at("/editor/other", Element {
+						delay:    Duration::from_millis(600),
+						name:     "",
+						role:     Role::Frame,
+						focused:  false,
+						children: Vec::new(),
+					})
+					.unwrap()
+					.serve_at("/editor/frame/entry", Element {
+						delay:    Duration::from_millis(600),
+						name:     "",
+						role:     Role::Entry,
+						focused:  true,
+						children: Vec::new(),
+					})
+					.unwrap()
+			});
+			let window = DesktopWindow {
+				id:      format!("atspi:{PEER}:/editor/frame"),
+				title:   String::new(),
+				app:     "Editor".to_owned(),
+				pid:     None,
+				x:       0,
+				y:       0,
+				width:   300,
+				height:  200,
+				focused: true,
+			};
+			(ax, server, window)
+		}
+
+		#[test]
+		fn focus_scan_keeps_a_responsive_tree_past_one_reply_limit() {
+			let (ax, _server, window) = slow_tree();
+			assert!(ax.holds_focus(&window));
+		}
+
+		#[test]
+		fn window_root_keeps_a_responsive_frame_scan_past_one_reply_limit() {
+			let (mut ax, _server, window) = slow_tree();
+			let root = ax.window_root(&window).unwrap();
+			assert_eq!(AtSpiAx::object(&root).path_as_str(), "/editor/frame");
+		}
+
+		#[test]
+		fn windows_keep_an_application_whose_replies_together_exceed_the_limit() {
+			let (ax, _server) = desktop_with_delay(true, Duration::from_millis(600));
+			let listed = ax.windows().unwrap();
+			assert_eq!(listed.windows.len(), 1);
+			assert_eq!(listed.windows[0].window.title, "Document");
+			assert_eq!(listed.unanswered, [":1.8"]);
+		}
+
+		#[test]
+		fn windows_and_focus_leave_out_an_application_that_never_answers() {
+			let (mut ax, _server) = desktop(true);
+			let listed = ax.windows().unwrap();
+			assert_eq!(
+				listed
+					.windows
+					.iter()
+					.map(|listed| (listed.window.app.as_str(), listed.window.title.as_str()))
+					.collect::<Vec<_>>(),
+				[("Editor", "Document")]
+			);
+			assert_eq!(listed.unanswered, [":1.8"]);
+			let Some(AxHandle::AtSpi(focused)) = ax.focused_element().unwrap() else {
+				panic!("the answering application's focus must be found");
+			};
+			assert_eq!(focused.path_as_str(), "/editor/frame");
+		}
+
+		#[test]
+		fn applications_that_never_answer_cost_the_listing_one_reply_limit_together() {
+			let (ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: (0..3)
+							.map(|index| (format!(":1.{}", 8 + index), path(&format!("/silent{index}"))))
+							.collect(),
+					})
+					.unwrap()
+					.serve_at("/silent0", Silent { cancel: None })
+					.unwrap()
+					.serve_at("/silent1", Silent { cancel: None })
+					.unwrap()
+					.serve_at("/silent2", Silent { cancel: None })
+					.unwrap()
+			});
+			let started = std::time::Instant::now();
+			let listed = ax.windows().unwrap();
+			assert_eq!(listed.unanswered, [":1.8", ":1.9", ":1.10"]);
+			assert!(started.elapsed() < HUNG_CALL_TIMEOUT * 2, "{:?}", started.elapsed());
+		}
+
+		#[test]
+		fn focus_found_nowhere_else_may_be_in_an_application_that_never_answers() {
+			let (mut ax, _server) = desktop(false);
+			assert_eq!(ax.focused_element().err().map(|error| error.code), Some(ErrorCode::Timeout));
+		}
+
+		#[test]
+		fn a_point_an_application_that_never_answers_may_own_is_not_resolved() {
+			let (mut ax, _server) = desktop(true);
+			assert_eq!(
+				ax.element_at(50.0, 50.0).err().map(|error| error.code),
+				Some(ErrorCode::Timeout)
+			);
+		}
+
+		/// A menu bar that names its parent frame and then answers no method
+		/// call.
+		struct SilentMenuBar {
+			parent: (String, OwnedObjectPath),
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl SilentMenuBar {
+			#[zbus(property)]
+			fn parent(&self) -> (String, OwnedObjectPath) {
+				self.parent.clone()
+			}
+
+			async fn get_role(&self) -> u32 {
+				std::future::pending().await
+			}
+		}
+
+		#[test]
+		fn a_menu_read_fails_when_the_application_stops_answering_part_way() {
+			let (mut ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor"))],
+					})
+					.unwrap()
+					.serve_at("/editor", Element {
+						delay:    Duration::ZERO,
+						name:     "Editor",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor/frame"))],
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Element {
+						delay:    Duration::ZERO,
+						name:     "Document",
+						role:     Role::Frame,
+						focused:  true,
+						children: vec![(PEER.to_owned(), path("/editor/frame/menubar"))],
+					})
+					.unwrap()
+					.serve_at("/editor/frame/menubar", SilentMenuBar {
+						parent: (PEER.to_owned(), path("/editor/frame")),
+					})
+					.unwrap()
+			});
+			let window = DesktopWindow {
+				id:      format!("atspi:{PEER}:/editor/frame"),
+				title:   "Document".into(),
+				app:     "Editor".into(),
+				pid:     None,
+				x:       0,
+				y:       0,
+				width:   300,
+				height:  200,
+				focused: true,
+			};
+			assert_eq!(
+				ax.menu_items(&window, &[]).err().map(|error| error.code),
+				Some(ErrorCode::Timeout)
+			);
+		}
+
+		/// A menu element that names its parent, as `menu_children` checks.
+		struct MenuNode {
+			name:     &'static str,
+			role:     Role,
+			parent:   &'static str,
+			children: &'static [&'static str],
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl MenuNode {
+			#[zbus(property)]
+			fn name(&self) -> String {
+				self.name.to_owned()
+			}
+
+			#[zbus(property)]
+			fn parent(&self) -> (String, OwnedObjectPath) {
+				(PEER.to_owned(), path(self.parent))
+			}
+
+			fn get_role(&self) -> u32 {
+				self.role as u32
+			}
+
+			#[allow(clippy::unused_self, reason = "every fake menu element is enabled")]
+			fn get_state(&self) -> Vec<u32> {
+				let state = State::Enabled as u64 | State::Sensitive as u64;
+				vec![state as u32, (state >> 32) as u32]
+			}
+
+			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				self
+					.children
+					.iter()
+					.map(|child| (PEER.to_owned(), path(child)))
+					.collect()
+			}
+		}
+
+		/// Qt 5 and 6 publish a menu bar item's menu as a `PopupMenu` child of
+		/// that item, where GTK publishes a `Menu`.
+		#[test]
+		fn a_qt_menu_bar_item_opens_its_popup_menu() {
+			let (mut ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				let menu = |name, role, parent, children: &'static [&'static str]| MenuNode {
+					name,
+					role,
+					parent,
+					children,
+				};
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/qt"))],
+					})
+					.unwrap()
+					.serve_at("/qt", Element {
+						delay:    Duration::ZERO,
+						name:     "qtapp",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/qt/frame"))],
+					})
+					.unwrap()
+					.serve_at("/qt/frame", Element {
+						delay:    Duration::ZERO,
+						name:     "Notes",
+						role:     Role::Frame,
+						focused:  true,
+						children: vec![(PEER.to_owned(), path("/qt/bar"))],
+					})
+					.unwrap()
+					.serve_at("/qt/bar", menu("", Role::MenuBar, "/qt/frame", &["/qt/file"]))
+					.unwrap()
+					.serve_at("/qt/file", menu("File", Role::MenuItem, "/qt/bar", &["/qt/popup"]))
+					.unwrap()
+					.serve_at(
+						"/qt/popup",
+						menu("", Role::PopupMenu, "/qt/file", &["/qt/mark", "/qt/other"]),
+					)
+					.unwrap()
+					.serve_at("/qt/mark", menu("Mark", Role::MenuItem, "/qt/popup", &[]))
+					.unwrap()
+					.serve_at("/qt/other", menu("Other", Role::MenuItem, "/qt/popup", &[]))
+					.unwrap()
+			});
+			let window = DesktopWindow {
+				id:      format!("atspi:{PEER}:/qt/frame"),
+				title:   "Notes".into(),
+				app:     "qtapp".into(),
+				pid:     None,
+				x:       0,
+				y:       0,
+				width:   300,
+				height:  200,
+				focused: true,
+			};
+			let bar = ax.menu_items(&window, &[]).unwrap();
+			assert_eq!(
+				bar.iter()
+					.map(|item| (item.title.as_str(), item.has_submenu))
+					.collect::<Vec<_>>(),
+				[("File", true)]
+			);
+			let file = ax.menu_items(&window, &["File".to_owned()]).unwrap();
+			assert_eq!(
+				file
+					.iter()
+					.map(|item| (item.path.join(" > "), item.has_submenu))
+					.collect::<Vec<_>>(),
+				[("File > Mark".to_owned(), false), ("File > Other".to_owned(), false)]
+			);
+		}
+
+		/// Which option of a fake combo box is chosen, and the actions performed.
+		#[derive(Clone, Default)]
+		struct ComboLog {
+			chosen:    Arc<Mutex<Option<&'static str>>>,
+			performed: Arc<Mutex<Vec<&'static str>>>,
+		}
+
+		struct ComboElement {
+			name:      &'static str,
+			role:      Role,
+			parent:    &'static str,
+			children:  &'static [&'static str],
+			selection: bool,
+			enabled:   bool,
+			name_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl ComboElement {
+			#[zbus(property)]
+			async fn name(&self) -> String {
+				let gate = self.name_gate.lock().unwrap().take();
+				if let Some(gate) = gate {
+					gate.wait().await;
+				}
+				self.name.to_owned()
+			}
+
+			#[zbus(property)]
+			fn parent(&self) -> (String, OwnedObjectPath) {
+				(PEER.to_owned(), path(self.parent))
+			}
+
+			fn get_role(&self) -> u32 {
+				self.role as u32
+			}
+
+			fn get_interfaces(&self) -> Vec<&'static str> {
+				let mut interfaces = vec!["org.a11y.atspi.Accessible", "org.a11y.atspi.Action"];
+				if self.selection {
+					interfaces.push("org.a11y.atspi.Selection");
+				}
+				interfaces
+			}
+
+			fn get_state(&self) -> Vec<u32> {
+				let state = if self.enabled {
+					State::Enabled as u64 | State::Sensitive as u64
+				} else {
+					0
+				};
+				vec![state as u32, (state >> 32) as u32]
+			}
+
+			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				self
+					.children
+					.iter()
+					.map(|child| (PEER.to_owned(), path(child)))
+					.collect()
+			}
+		}
+
+		/// An element's actions. Performing one records `title`, and chooses it
+		/// when `applies`.
+		struct ComboAction {
+			names:   &'static [&'static str],
+			title:   &'static str,
+			applies: bool,
+			log:     ComboLog,
+		}
+
+		#[interface(name = "org.a11y.atspi.Action")]
+		impl ComboAction {
+			#[zbus(property)]
+			fn n_actions(&self) -> i32 {
+				self.names.len() as i32
+			}
+
+			fn get_name(&self, index: i32) -> String {
+				self.names[index as usize].to_owned()
+			}
+
+			fn do_action(&self, index: i32) -> bool {
+				let exists = usize::try_from(index).is_ok_and(|index| index < self.names.len());
+				if exists {
+					self.log.performed.lock().unwrap().push(self.title);
+				}
+				if exists && self.applies {
+					*self.log.chosen.lock().unwrap() = Some(self.title);
+				}
+				exists
+			}
+		}
+
+		/// The `Selection` naming the chosen option.
+		struct ComboSelection {
+			log: ComboLog,
+		}
+
+		#[interface(name = "org.a11y.atspi.Selection")]
+		impl ComboSelection {
+			#[zbus(property)]
+			fn n_selected_children(&self) -> i32 {
+				i32::from(self.log.chosen.lock().unwrap().is_some())
+			}
+
+			fn get_selected_child(&self, index: i32) -> (String, OwnedObjectPath) {
+				let chosen = self.log.chosen.lock().unwrap().filter(|_| index == 0);
+				let at = chosen.map_or_else(
+					|| "/org/a11y/atspi/null".to_owned(),
+					|title| format!("/combo/list/{title}"),
+				);
+				(PEER.to_owned(), path(&at))
+			}
+		}
+
+		#[derive(Clone, Copy)]
+		enum Toolkit {
+			/// GTK 3: the combo box publishes the choice, options take `click`.
+			Gtk,
+			/// The option names wait until all their reads are in flight.
+			Concurrent,
+			/// Chromium: the list publishes the choice, options take `select`,
+			/// and the combo box's `open` takes no keyboard grab.
+			Chromium,
+			/// Qt: nothing publishes the choice, options take only `Toggle`.
+			Qt,
+			/// GTK 3, but the app ignores the option's action.
+			Ignoring,
+			/// GTK 3, greyed out.
+			Disabled,
+		}
+
+		/// A combo box at `/combo` with options One, Two and Three.
+		fn combo_box(toolkit: Toolkit) -> (AtSpiAx, Connection, ComboLog) {
+			const OPTIONS: [&str; 3] = ["One", "Two", "Three"];
+			const PATHS: [&str; 3] = ["/combo/list/One", "/combo/list/Two", "/combo/list/Three"];
+			struct Shape {
+				combo_selection: bool,
+				list_selection:  bool,
+				combo_actions:   &'static [&'static str],
+				names:           &'static [&'static str],
+				applies:         bool,
+				enabled:         bool,
+			}
+			let log = ComboLog::default();
+			let gtk = Shape {
+				combo_selection: true,
+				list_selection:  false,
+				combo_actions:   &["press"],
+				names:           &["click"],
+				applies:         true,
+				enabled:         true,
+			};
+			let Shape { combo_selection, list_selection, combo_actions, names, applies, enabled } =
+				match toolkit {
+					Toolkit::Gtk | Toolkit::Concurrent => gtk,
+					Toolkit::Chromium => Shape {
+						combo_selection: false,
+						list_selection: true,
+						combo_actions: &["open", "showContextMenu"],
+						names: &["select", "showContextMenu"],
+						..gtk
+					},
+					Toolkit::Qt => Shape {
+						combo_selection: false,
+						combo_actions: &["Show-Menu", "Press"],
+						names: &["Toggle"],
+						..gtk
+					},
+					Toolkit::Ignoring => Shape { applies: false, ..gtk },
+					Toolkit::Disabled => Shape { enabled: false, ..gtk },
+				};
+			let name_gate = matches!(toolkit, Toolkit::Concurrent)
+				.then(|| Arc::new(tokio::sync::Barrier::new(OPTIONS.len())));
+			let served = log.clone();
+			let (ax, server) = backend(HUNG_CALL_TIMEOUT, move |server| {
+				let mut server = server
+					.serve_at("/combo", ComboElement {
+						name: "Choice",
+						role: Role::ComboBox,
+						parent: "/frame",
+						children: &["/combo/list"],
+						selection: combo_selection,
+						enabled,
+						name_gate: Mutex::new(None),
+					})
+					.unwrap()
+					.serve_at("/combo", ComboAction {
+						names:   combo_actions,
+						title:   "the combo box",
+						applies: false,
+						log:     served.clone(),
+					})
+					.unwrap()
+					.serve_at("/combo/list", ComboElement {
+						name:      "",
+						role:      Role::Menu,
+						parent:    "/combo",
+						children:  &PATHS,
+						selection: list_selection,
+						enabled:   true,
+						name_gate: Mutex::new(None),
+					})
+					.unwrap();
+				if combo_selection {
+					server = server
+						.serve_at("/combo", ComboSelection { log: served.clone() })
+						.unwrap();
+				}
+				if list_selection {
+					server = server
+						.serve_at("/combo/list", ComboSelection { log: served.clone() })
+						.unwrap();
+				}
+				for (title, at) in OPTIONS.into_iter().zip(PATHS) {
+					server = server
+						.serve_at(at, ComboElement {
+							name:      title,
+							role:      Role::MenuItem,
+							parent:    "/combo/list",
+							children:  &[],
+							selection: false,
+							enabled:   true,
+							name_gate: Mutex::new(name_gate.clone()),
+						})
+						.unwrap()
+						.serve_at(at, ComboAction { names, title, applies, log: served.clone() })
+						.unwrap();
+				}
+				server
+			});
+			(ax, server, log)
+		}
+
+		#[test]
+		fn a_combo_box_option_is_chosen_without_opening_its_list() {
+			let combo = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo"));
+			let option =
+				AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo/list/One"));
+			let performed = |log: &ComboLog| log.performed.lock().unwrap().clone();
+			let error = |result: CoreResult<()>| result.unwrap_err();
+			let message = |result: CoreResult<()>| error(result).message;
+
+			// GTK 3: setValue performs the option's own action and reads it back.
+			let (mut ax, _server, log) = combo_box(Toolkit::Gtk);
+			ax.set_value(&combo, "Two").unwrap();
+			assert_eq!(performed(&log), ["Two"]);
+			// Already chosen: nothing is performed again.
+			ax.set_value(&combo, "Two").unwrap();
+			assert_eq!(performed(&log), ["Two"]);
+			let missing = message(ax.set_value(&combo, "Four"));
+			assert!(missing.contains("Options: \"One\", \"Two\", \"Three\""), "{missing}");
+			// A press would open the list: refused, the combo box's own action
+			// not performed.
+			let press = message(ax.perform(&combo, "press"));
+			assert!(press.contains("nothing was pressed"), "{press}");
+			assert!(press.contains("setValue(option)"), "{press}");
+			// A menu path names one option, and only a combo box's press takes
+			// one.
+			let two = error(ax.perform_menu(&combo, "press", &["One".to_owned(), "Two".to_owned()]));
+			assert_eq!(two.code, ErrorCode::AxFailed, "{}", two.message);
+			let item = error(ax.perform_menu(&option, "press", &["One".to_owned()]));
+			assert_eq!(item.code, ErrorCode::Unsupported, "{}", item.message);
+			assert_eq!(performed(&log), ["Two"]);
+		}
+
+		#[test]
+		fn combo_option_names_are_read_concurrently_before_choosing() {
+			let combo = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo"));
+			let (mut ax, _server, log) = combo_box(Toolkit::Concurrent);
+			ax.set_value(&combo, "Two").unwrap();
+			assert_eq!(*log.performed.lock().unwrap(), ["Two"]);
+		}
+
+		#[test]
+		fn chromium_combo_menu_chooses_and_plain_press_still_opens() {
+			let combo = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo"));
+			let performed = |log: &ComboLog| log.performed.lock().unwrap().clone();
+
+			// Chromium: press with a menu path chooses through the list, and a
+			// plain press opens it as on main.
+			let (mut ax, _server, log) = combo_box(Toolkit::Chromium);
+			ax.perform_menu(&combo, "press", &["Three".to_owned()])
+				.unwrap();
+			ax.perform(&combo, "press").unwrap();
+			assert_eq!(performed(&log), ["Three", "the combo box"]);
+		}
+
+		#[test]
+		fn qt_combo_refuses_to_open_or_choose_its_hidden_list() {
+			let combo = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo"));
+			let message = |result: CoreResult<()>| result.unwrap_err().message;
+			let performed = |log: &ComboLog| log.performed.lock().unwrap().clone();
+
+			// Qt: no action chooses an option, and both of the combo box's
+			// actions open the list, so nothing is performed.
+			let (mut ax, _server, log) = combo_box(Toolkit::Qt);
+			let qt = message(ax.set_value(&combo, "Two"));
+			assert!(qt.contains("needs the user's screen"), "{qt}");
+			for action in ["press", "Show-Menu"] {
+				let press = message(ax.perform(&combo, action));
+				assert!(press.contains("nothing was pressed"), "{action}: {press}");
+			}
+			assert!(performed(&log).is_empty());
+		}
+
+		#[test]
+		fn a_combo_option_action_that_does_not_choose_is_reported() {
+			let combo = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo"));
+			let message = |result: CoreResult<()>| result.unwrap_err().message;
+			let performed = |log: &ComboLog| log.performed.lock().unwrap().clone();
+
+			// An app that ignores the action: the choice is not confirmed.
+			let (mut ax, _server, log) = combo_box(Toolkit::Ignoring);
+			let ignored = message(ax.set_value(&combo, "Two"));
+			assert!(ignored.contains("now shows no option"), "{ignored}");
+			assert_eq!(performed(&log), ["Two"]);
+		}
+
+		#[test]
+		fn a_disabled_combo_is_left_alone() {
+			let combo = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/combo"));
+			let message = |result: CoreResult<()>| result.unwrap_err().message;
+			let performed = |log: &ComboLog| log.performed.lock().unwrap().clone();
+
+			// A greyed-out combo box is left alone.
+			let (mut ax, _server, log) = combo_box(Toolkit::Disabled);
+			let disabled = message(ax.set_value(&combo, "Two"));
+			assert!(disabled.contains("disabled"), "{disabled}");
+			assert!(performed(&log).is_empty());
+		}
 	}
 }
