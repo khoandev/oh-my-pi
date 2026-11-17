@@ -412,11 +412,16 @@ describe("ModelRegistry", () => {
 
 	test("resolves the no-auth sentinel for a keyless transport provider", async () => {
 		const keylessModel = buildModel({
-			...testModel,
 			id: "big-pickle",
 			name: "Big Pickle",
+			api: "openai-completions",
 			provider: "opencode-zen",
 			baseUrl: "https://opencode.ai/zen/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
 		});
 
 		expect(await registry.getApiKey(keylessModel)).toBe(kNoAuth);
