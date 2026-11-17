@@ -3810,6 +3810,11 @@ export class ModelRegistry {
 		);
 	}
 
+	/** Transport authenticates without a resolved key (e.g. Zen's anonymous free tier). */
+	#allowsMissingApiKey(provider: string): boolean {
+		return getProviderDefinition(provider)?.allowsMissingApiKey === true;
+	}
+
 	/** Resolve a model's request credential or the no-auth sentinel. */
 	async getApiKey(
 		model: Model<Api>,
@@ -3822,12 +3827,18 @@ export class ModelRegistry {
 		if (this.#isKeylessProvider(model.provider)) {
 			return kNoAuth;
 		}
-		return this.authStorage.keys.get(model.provider, sessionId, {
+		const apiKey = await this.authStorage.keys.get(model.provider, sessionId, {
 			baseUrl: model.baseUrl,
 			modelId: model.id,
 			accountIds: model.accountAccess && Object.keys(model.accountAccess),
 			signal: options?.signal,
 		});
+		// A keyless transport (OpenCode Zen's `public` free tier) authenticates
+		// inline, so a provider with no stored or env credential resolves the
+		// no-auth sentinel instead of failing the prompt preflight before the
+		// wire layer can inject its own credential.
+		if (apiKey === undefined && this.#allowsMissingApiKey(model.provider)) return kNoAuth;
+		return apiKey;
 	}
 
 	/** Resolve request authentication through the historical Pi extension facade. */
@@ -3885,7 +3896,7 @@ export class ModelRegistry {
 			return { apiKey: kNoAuth };
 		}
 		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;
-		return this.authStorage.keys.getWithCredential(provider, sessionId, {
+		const resolved = await this.authStorage.keys.getWithCredential(provider, sessionId, {
 			baseUrl: options?.baseUrl,
 			modelId: options?.modelId,
 			accountIds: accountAccess && Object.keys(accountAccess),
@@ -3894,6 +3905,8 @@ export class ModelRegistry {
 			rejectedAccessToken: options?.rejectedAccessToken,
 			signal: options?.signal,
 		});
+		if (resolved === undefined && this.#allowsMissingApiKey(provider)) return { apiKey: kNoAuth };
+		return resolved;
 	}
 
 	/**

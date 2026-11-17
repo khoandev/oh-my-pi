@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { runModelsListing } from "../../src/cli/models-cli";
-import { ModelRegistry } from "../../src/config/model-registry";
+import { kNoAuth, ModelRegistry } from "../../src/config/model-registry";
 
 const testModel = buildModel({
 	id: "test-model",
@@ -408,6 +408,18 @@ describe("ModelRegistry", () => {
 			ok: false,
 			error: 'No API key found for "test"',
 		});
+	});
+
+	test("resolves the no-auth sentinel for a keyless transport provider", async () => {
+		const keylessModel = buildModel({
+			...testModel,
+			id: "big-pickle",
+			name: "Big Pickle",
+			provider: "opencode-zen",
+			baseUrl: "https://opencode.ai/zen/v1",
+		});
+
+		expect(await registry.getApiKey(keylessModel)).toBe(kNoAuth);
 	});
 
 	test("maps legacy extension auth failures into the result contract", async () => {
