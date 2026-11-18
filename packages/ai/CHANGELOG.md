@@ -5,6 +5,10 @@
 ### Fixed
 
 - Anonymous OpenCode Zen free-tier sessions now send the `Bearer public` credential instead of dropping authorization: a keyless request passes the generic stream dispatch (`allows-missing-api-key`), and the `N/A` no-auth sentinel from a keyless login is treated as no key on both OpenAI- and Anthropic-routed free models
+### Added
+
+- Claude usage reports now carry the account's subscription plan (`Max 5x`, `Max 20x`, `Pro`, `Team`, `Enterprise`) in `metadata.subscriptionPlan`, read from the OAuth profile on every fetch, so an auth broker serves it to its clients with the rest of the report. Added `usageSubscriptionPlan` and `claudeProfilePlan`
+
 ## [18.22.2] - 2026-11-18
 
 ### Added

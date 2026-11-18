@@ -83,10 +83,7 @@ describe("async speculative compaction", () => {
 			convertToLlmForSideRequest?: (messages: AgentMessage[]) => never;
 			buildLiveProviderContext?: (summarized: AgentMessage[], retained: AgentMessage[]) => Promise<Context>;
 			persistTurnMessagesForMidRunCompaction?: () => Promise<boolean>;
-			generateHandoffDocument?: (
-				focus: string,
-				options?: { autoTriggered?: boolean; signal?: AbortSignal },
-			) => Promise<{ document: string } | undefined>;
+			generateHandoffDocument?: SessionMaintenanceHost["generateHandoffDocument"];
 		} = {},
 	): SessionMaintenance {
 		agent = new Agent({
@@ -117,7 +114,8 @@ describe("async speculative compaction", () => {
 			thinkingLevel: () => undefined,
 			isDisposed: () => false,
 			isStreaming: () => false,
-			isGeneratingHandoff: () => false,
+			isSessionTransitioning: () => false,
+			waitForIdle: async () => {},
 			promptGeneration: () => 0,
 			hasExperimentalContextRolloverTools: () => options.recoveryTools ?? true,
 			queueExperimentalContextNotesReminder: () => events.push("notes-reminder"),
@@ -168,7 +166,6 @@ describe("async speculative compaction", () => {
 			parseRetryAfterMsFromError: () => undefined,
 			setModelTemporary: async () => {},
 			abort: async () => {},
-			abortHandoff: () => {},
 		} as unknown as SessionMaintenanceHost;
 		return new SessionMaintenance(host);
 	}
@@ -681,7 +678,7 @@ describe("async speculative compaction", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		cfgCompactionAsyncEnabled.override(maintenanceSettings, true);
 		await maintenance.maintainContextMidRun(activeMessages, undefined, context);
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 
@@ -689,7 +686,7 @@ describe("async speculative compaction", () => {
 		sessionManager.appendMessage(nextRequest);
 		activeMessages.push(nextRequest);
 		await maintenance.maintainContextMidRun(activeMessages, undefined, context);
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 	});
 
@@ -875,7 +872,7 @@ describe("async speculative compaction", () => {
 		}));
 
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 
 		// Later boundaries neither re-send it nor hold the threshold pass for it.
@@ -895,7 +892,7 @@ describe("async speculative compaction", () => {
 		appendSummarizableConversation();
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
 		expect(maintenance.speculationState).toBe("running");
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 	});
 
@@ -917,7 +914,7 @@ describe("async speculative compaction", () => {
 			}));
 
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 
 		// The failed native method is skipped; soft still runs in the background
@@ -947,10 +944,10 @@ describe("async speculative compaction", () => {
 			);
 
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START + 500, CONTEXT_WINDOW);
 		expect(maintenance.speculationState).toBe("running");
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 	});
 
@@ -965,12 +962,12 @@ describe("async speculative compaction", () => {
 			);
 
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		await sessionManager.newSession();
 		appendSummarizableConversation();
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
 		expect(maintenance.speculationState).toBe("running");
-		await maintenance.speculationCompletion;
+		await maintenance.speculationCompletion();
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 	});
 
@@ -1057,9 +1054,7 @@ describe("async speculative compaction", () => {
 
 	it("discards an armed handoff summary when post-snapshot branch growth prevents recovery headroom", async () => {
 		let handoffInvocation = 0;
-		const generateHandoffDocument = vi.fn(async () => ({
-			document: `handoff plan ${++handoffInvocation}`,
-		}));
+		const generateHandoffDocument = vi.fn(async () => `handoff plan ${++handoffInvocation}`);
 		maintenance = createMaintenance({
 			methodOrder: ["handoff"],
 			generateHandoffDocument,
@@ -1085,9 +1080,7 @@ describe("async speculative compaction", () => {
 
 	it("retains and claims an armed handoff summary when post-snapshot growth fits comfortably within recovery band", async () => {
 		let handoffInvocation = 0;
-		const generateHandoffDocument = vi.fn(async () => ({
-			document: `handoff plan ${++handoffInvocation}`,
-		}));
+		const generateHandoffDocument = vi.fn(async () => `handoff plan ${++handoffInvocation}`);
 		maintenance = createMaintenance({
 			methodOrder: ["handoff"],
 			generateHandoffDocument,
