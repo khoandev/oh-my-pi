@@ -18,8 +18,9 @@ import {
 	TRANSFORMERS_VERSION,
 } from "../subprocess/worker-runtime";
 import { resolveTinyModelDevicePreference, type TinyModelDevice, tinyModelDeviceLoadOrder } from "../tiny/device";
+import { runFramedStdioWorker } from "../daemon/modules/speech-frames";
 import { resolveLocalModelDtype, resolveTinyModelDtypeOverride, type TinyModelDtype } from "../tiny/dtype";
-import type { SttTransport, SttWorkerInbound } from "./asr-protocol";
+import type { SttTransport, SttWorkerInbound, SttWorkerOutbound } from "./asr-protocol";
 import { type EndpointerEvent, StreamEndpointer } from "./endpointer";
 import {
 	getSttModelSpec,
@@ -672,4 +673,9 @@ export function startSttWorker(transport: SttTransport): void {
 				return;
 		}
 	});
+}
+
+/** Process entry of `__omp_worker_stt`: serve the daemon `speech` module over stdio frames. */
+export function runSttWorker(): Promise<void> {
+	return runFramedStdioWorker<SttWorkerInbound, SttWorkerOutbound>(startSttWorker);
 }
