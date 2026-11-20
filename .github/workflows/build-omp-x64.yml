@@ -51,6 +51,18 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # GitHub-hosted runners get no vmon Bazel cache, so every run re-downloads
+      # the rust toolchain and crate archives. Cache Bazel's repository cache of
+      # those verified downloads; a warm entry removes the network dependency
+      # that failed run 44737528274 (static.rust-lang.org connect timeout).
+      - name: Cache Bazel repository downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/bazel-repo-cache
+          key: bazel-repo-${{ matrix.target }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelversion') }}
+          restore-keys: |
+            bazel-repo-${{ matrix.target }}-
+
       # Build native .node files directly.
       # Không phụ thuộc artifact từ job khác.
       - id: cache
@@ -68,7 +80,22 @@ jobs:
           # bazel server (limits are per-process and the server persists).
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           read -r -a targets <<< "$NATIVE_TARGETS"
-          bun scripts/bazel-natives.ts "${targets[@]}" --dest packages/natives/native
+          log="$RUNNER_TEMP/bazel-build.log"
+          # Retry only transient repository-fetch failures: the runner has no
+          # warm Bazel cache on the first run for a lockfile state, and Bazel's
+          # own downloader retries were exhausted by a multi-minute outage. A
+          # deterministic failure (compile error, bad target) fails immediately.
+          for attempt in 1 2 3; do
+            status=0
+            bun scripts/bazel-natives.ts "${targets[@]}" --dest packages/natives/native \
+              -- --repository_cache="$HOME/.cache/bazel-repo-cache" 2>&1 | tee "$log" || status=$?
+            if [ "$status" -eq 0 ]; then exit 0; fi
+            if [ "$attempt" -eq 3 ] || ! grep -Eq 'Connect timed out|SocketException|Connection reset|failed to fetch|Download from .* failed|HTTP (5[0-9][0-9]|timeout)' "$log"; then
+              exit "$status"
+            fi
+            echo "::warning title=Build native addons::transient download failure (attempt $attempt/3); retrying"
+            sleep 30
+          done
 
       - name: Build ${{ matrix.target }}
         env:
