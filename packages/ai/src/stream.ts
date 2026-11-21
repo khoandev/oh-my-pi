@@ -1000,7 +1000,7 @@ function streamDispatch<TApi extends Api>(
 	// anonymous free tier) authenticate inside their transport: it injects the
 	// public credential after the client-identity gate. Let a keyless request
 	// through instead of failing here before the wire layer can run.
-	if (!apiKey && !getProviderDefinition(providerModel.provider)?.allowsMissingApiKey) {
+	if (!apiKey && !getProviderDefinition(model.provider)?.allowsMissingApiKey) {
 		throw new AIError.MissingApiKeyError(providerModel.provider);
 	}
 	const providerOptions = isGoogleVertexAuthenticatedModel(providerModel)
