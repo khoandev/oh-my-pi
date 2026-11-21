@@ -86,6 +86,7 @@ import type {
 import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
+import { isPromptPerturbationEnabled, perturbPromptText } from "@oh-my-pi/pi-ai/prompts/perturbation";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -9114,12 +9115,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * directive would add nothing. Otherwise the hidden manual-continue directive
 	 * asks the model to pick its work back up. A conversation with neither a user
 	 * turn nor a compaction/branch summary of earlier ones cannot be continued.
+	 * `onAdmitted` fires once a continue directive claims the session; a resume that
+	 * schedules the continuation or hands the run to queued input returns without
+	 * calling it, once that is under way.
 	 *
 	 * @throws {AgentBusyError} when another turn claims the session between the interrupt and the continuation.
 	 * @throws {Error} when there is no conversation to resume.
 	 */
-	async resume(): Promise<void> {
-		if (!this.isStreaming) return this.#resumeIdle();
+	async resume(options?: { onAdmitted?: () => void }): Promise<void> {
+		const onAdmitted = options?.onAdmitted;
+		if (!this.isStreaming) return this.#resumeIdle(onAdmitted);
 		// waitForIdle() reads a pending unwind as busy. Hold one from the interrupt
 		// until the continuation is live, so a host driving this session to a result
 		// (the subagent executor) never mistakes the gap for the end of the run.
@@ -9133,7 +9138,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			await this.abort({ reason: USER_INTERRUPT_LABEL, deliverQueuedMessages: queued });
 			// Interrupt-and-send: the abort's own drain resumes the run with the queued input.
 			if (queued) return;
-			await this.#resumeIdle(() => void this.#waitForPromptDispatchLive().then(release));
+			await this.#resumeIdle(() => {
+				onAdmitted?.();
+				void this.#waitForPromptDispatchLive().then(release);
+			});
 		} finally {
 			release();
 		}
@@ -16660,14 +16668,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	async #formatLlmRequestJson(messages: AgentMessage[]): Promise<string> {
 		const llmMessages = await this.convertMessagesToLlm(messages);
+		const model = this.agent.state.model;
+		// Mirror `streamDispatch`: show the prose the model receives, not the bundled wording.
+		const perturb = model && isPromptPerturbationEnabled(model) ? perturbPromptText : (text: string) => text;
 		const payload = {
-			model: this.agent.state.model ?? null,
+			model: model ?? null,
 			thinkingLevel: this.thinkingLevel ?? null,
 			serviceTier: this.#models.serviceTierEntry(),
-			systemPrompt: this.agent.state.systemPrompt,
+			systemPrompt: this.agent.state.systemPrompt.map(perturb),
 			tools: this.agent.state.tools.map(tool => ({
 				name: tool.name,
-				description: tool.description,
+				description: perturb(tool.description),
 				parameters: toolWireSchema(tool),
 				...(tool.strict !== undefined ? { strict: tool.strict } : {}),
 				...(tool.customWireName ? { customWireName: tool.customWireName } : {}),
