@@ -74,7 +74,9 @@ import {
 	streamOpenAICompletions,
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
+import { getProviderHooks } from "./provider-hooks";
 import { getProviderDefinition } from "./registry";
+import type { PreparedProviderRequest } from "./registry/types";
 import type {
 	Api,
 	AssistantMessage,
@@ -891,6 +893,13 @@ export function stream<TApi extends Api>(
 	);
 }
 
+/** Applies the provider's own model normalization and request shaping ahead of its api adapter. */
+function prepareProviderRequest(model: Model<Api>, options: StreamOptions): PreparedProviderRequest {
+	const definition = getProviderDefinition(model.provider);
+	const requestModel = definition?.prepareModel?.(model) ?? model;
+	return definition?.prepareRequest?.(requestModel, options) ?? { model: requestModel, options };
+}
+
 function streamDispatch<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
@@ -926,6 +935,17 @@ function streamDispatch<TApi extends Api>(
 				requestOptions = { ...requestOptions, toolChoice: "none" } as OptionsForApi<TApi>;
 			}
 		}
+	}
+
+	// A provider hook owns every request to the provider, ahead of api-level dispatch.
+	const hooks = getProviderHooks(model.provider);
+	if (hooks?.stream) {
+		const prepared = prepareProviderRequest(model, requestOptions as StreamOptions);
+		return hooks.stream(prepared.model, context, {
+			...prepared.options,
+			apiKey: prepared.options.apiKey || getEnvApiKey(prepared.model.provider),
+			waitForTerminalDrain: limited,
+		});
 	}
 
 	// Check custom API registry first (extension-provided APIs like "vertex-claude-api")
@@ -971,17 +991,16 @@ function streamDispatch<TApi extends Api>(
 		});
 	}
 
-	const providerDefinition = getProviderDefinition(model.provider);
-	const requestModel = providerDefinition?.prepareModel?.(model) ?? model;
-	const prepared = providerDefinition?.prepareRequest?.(requestModel, requestOptions as StreamOptions);
-	const providerModel = prepared?.model ?? requestModel;
-	const preparedOptions = prepared?.options ?? (requestOptions as StreamOptions);
+	const { model: providerModel, options: preparedOptions } = prepareProviderRequest(
+		model,
+		requestOptions as StreamOptions,
+	);
 	const apiKey = preparedOptions.apiKey || getEnvApiKey(providerModel.provider);
 	// Providers that declare `allows-missing-api-key` (e.g. OpenCode Zen's
 	// anonymous free tier) authenticate inside their transport: it injects the
 	// public credential after the client-identity gate. Let a keyless request
 	// through instead of failing here before the wire layer can run.
-	if (!apiKey && !providerDefinition?.allowsMissingApiKey) {
+	if (!apiKey && !getProviderDefinition(providerModel.provider)?.allowsMissingApiKey) {
 		throw new AIError.MissingApiKeyError(providerModel.provider);
 	}
 	const providerOptions = isGoogleVertexAuthenticatedModel(providerModel)
@@ -1501,6 +1520,13 @@ function streamSimpleDispatch<TApi extends Api>(
 				return streamPiNative(model, context, nativeOptions);
 			}),
 		);
+	}
+
+	// A hooked provider keeps its api's option mapping; stream() then hands the request to the hook.
+	if (getProviderHooks(model.provider)?.stream) {
+		const providerModel = getProviderDefinition(model.provider)?.prepareModel?.(model) ?? model;
+		const apiKey = typeof requestOptions.apiKey === "string" ? requestOptions.apiKey : getEnvApiKey(model.provider);
+		return stream(providerModel, context, mapOptionsForApi(providerModel, requestOptions, apiKey));
 	}
 
 	// Check custom API registry (extension-provided APIs)
