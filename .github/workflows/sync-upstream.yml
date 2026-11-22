@@ -3,7 +3,7 @@ name: Sync upstream
 on:
   schedule:
     # GitHub Actions có jitter nên cron */15 sẽ chạy trễ vài phút mỗi lần.
-    - cron: "*/15 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
