@@ -4003,8 +4003,10 @@ export class ModelRegistry {
 	 * Mirrors the upstream `@mariozechner/pi-coding-agent` API surface so that
 	 * external plugins/extensions and downstream wrappers (e.g. subagent launch
 	 * paths that pre-flight auth before model resolution) can probe a model
-	 * without resolving an API key. Returns true for keyless providers as well
-	 * as providers with stored credentials. See issue #993.
+	 * without resolving an API key. Returns true for keyless providers, for
+	 * providers whose transport authenticates without a key (OpenCode Zen's
+	 * anonymous `public` free tier), and for providers with stored credentials.
+	 * See issue #993.
 	 *
 	 * Side-effect-free and synchronous: a command-backed key (`!cmd`) counts as
 	 * configured by its presence alone — the program is NOT executed — and OAuth
@@ -4023,6 +4025,7 @@ export class ModelRegistry {
 		return (
 			keyConfig !== undefined ||
 			this.#keylessProviders.has(model.provider) ||
+			this.#allowsMissingApiKey(model.provider) ||
 			this.authStorage.keys.source(model.provider, { env: "aliases" }) !== undefined ||
 			this.authStorage.keys.keyless(model.provider)
 		);

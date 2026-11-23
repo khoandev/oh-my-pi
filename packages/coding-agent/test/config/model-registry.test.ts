@@ -427,6 +427,23 @@ describe("ModelRegistry", () => {
 		expect(await registry.getApiKey(keylessModel)).toBe(kNoAuth);
 	});
 
+	test("reports configured auth for a keyless transport provider with no stored credential", () => {
+		const keylessModel = buildModel({
+			id: "qwen4-max-free",
+			name: "Qwen4 Max Free",
+			api: "openai-completions",
+			provider: "opencode-zen",
+			baseUrl: "https://opencode.ai/zen/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+		});
+
+		expect(registry.hasConfiguredAuth(keylessModel)).toBe(true);
+	});
+
 	test("maps legacy extension auth failures into the result contract", async () => {
 		const model = testModel;
 		vi.spyOn(registry, "getApiKey").mockRejectedValue(new Error("auth failed"));

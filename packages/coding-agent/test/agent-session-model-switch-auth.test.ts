@@ -121,6 +121,18 @@ describe("AgentSession model switch auth pre-flight", () => {
 		expect(getApiKeySpy).not.toHaveBeenCalled();
 	});
 
+	it("temporary switch to a keyless transport model needs no stored credential", async () => {
+		const from = modelOrThrow("claude-sonnet-4-5");
+		const to = getBundledModel("opencode-zen", "qwen4-max-free");
+		if (!to) throw new Error("Expected opencode-zen/qwen4-max-free to exist");
+		const s = makeSession(from);
+
+		await s.setModelTemporary(to);
+
+		expect(s.model?.provider).toBe("opencode-zen");
+		expect(s.model?.id).toBe(to.id);
+	});
+
 	it("rejects the switch synchronously when no credential is configured, without calling the resolver", async () => {
 		const from = modelOrThrow("claude-sonnet-4-5");
 		const to = modelOrThrow("claude-sonnet-4-6");
