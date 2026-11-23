@@ -4314,8 +4314,8 @@ export class ModelRegistry {
 		// A provider-scoped call without a model cannot tell a free lane from a
 		// paid one, so it keeps the provider-level answer; model-aware callers
 		// (resolver(model), the judge and hint compressors) get the free-tier gate.
-		const allowsMissing = model
-			? this.#allowsMissingApiKey(model)
+		const allowsMissing = options?.modelId
+			? model !== undefined && this.#allowsMissingApiKey(model)
 			: getProviderDefinition(provider)?.allowsMissingApiKey === true;
 		if (resolved === undefined && allowsMissing) return { apiKey: kNoAuth };
 		return resolved;

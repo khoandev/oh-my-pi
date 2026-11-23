@@ -563,7 +563,7 @@ export class NativeJudge implements Judge {
 		const headers: Record<string, string> = {
 			...this.#headers,
 			...requestHeaders,
-			...(target.token === ""
+			...(target.token === "" || target.token === NO_AUTH_SENTINEL
 				? {}
 				: target.tokenHeader === undefined
 					? { Authorization: `Bearer ${target.token}` }

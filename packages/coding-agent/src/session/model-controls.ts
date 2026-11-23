@@ -451,7 +451,7 @@ export class ModelControls {
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
 	}
 
-	#getScopedModelsWithApiKey(): Array<{ model: Model; thinkingLevel?: ThinkingLevel }> {
+	#getScopedModelsWithAuth(): Array<{ model: Model; thinkingLevel?: ThinkingLevel }> {
 		// Model-aware: a provider whose transport is keyless only on its free
 		// tier must not put a paid lane into the cycle, where the switch would
 		// land and the request would 401.
@@ -460,7 +460,7 @@ export class ModelControls {
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
-		const scopedModels = this.#getScopedModelsWithApiKey();
+		const scopedModels = this.#getScopedModelsWithAuth();
 		if (scopedModels.length <= 1) return undefined;
 
 		let currentIndex = findScopedModelIndex(scopedModels, this.#model);
