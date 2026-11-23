@@ -557,8 +557,7 @@ export class NativeJudge implements Judge {
 		// The keyless marker must never reach an authentication header: OpenCode's
 		// free lanes expect the literal `public` credential, and every other
 		// transport must send no credential at all rather than `Bearer N/A`.
-		const credential =
-			key === NO_AUTH_SENTINEL ? (isOpenCodeProvider(this.provider) ? OPENCODE_PUBLIC_KEY : "") : key;
+		const credential = key === NO_AUTH_SENTINEL && isOpenCodeProvider(this.provider) ? OPENCODE_PUBLIC_KEY : key;
 		const target = this.#wire.target(this.baseUrl, this.model, credential);
 		const headers: Record<string, string> = {
 			...this.#headers,

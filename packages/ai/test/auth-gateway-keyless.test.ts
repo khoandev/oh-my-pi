@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { NO_AUTH_SENTINEL } from "@oh-my-pi/pi-ai";
-import { resolveGatewayApiKey } from "@oh-my-pi/pi-ai/auth-gateway/dispatch";
+import { type AuthGatewayCredentialOptions, resolveGatewayApiKey } from "@oh-my-pi/pi-ai/auth-gateway/dispatch";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
-const storage = { keys: { getWithCredential: async () => undefined } } as never;
-const options = { storage } as never;
+const options: AuthGatewayCredentialOptions = {
+	storage: {
+		keys: { getWithCredential: async () => undefined },
+	} as unknown as AuthGatewayCredentialOptions["storage"],
+};
 
 function openCodeModel(id: string, inputCost: number) {
 	return buildModel({
