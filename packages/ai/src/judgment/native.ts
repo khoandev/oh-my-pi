@@ -30,8 +30,9 @@ import {
 import { resolveJudgmentQuestionsMax } from "@oh-my-pi/pi-catalog/compat/judgment-questions";
 import { TYPESAFE_DEFAULT_BASE_URL } from "@oh-my-pi/pi-catalog/discovery";
 import type { Api, FetchImpl } from "@oh-my-pi/pi-catalog/types";
+import { isOpenCodeProvider, OPENCODE_PUBLIC_KEY } from "@oh-my-pi/pi-catalog/wire/opencode";
 import { $env, isRecord, parseImageMetadata, tryParseJson } from "@oh-my-pi/pi-utils";
-import { type ApiKey, withAuth } from "../auth-retry";
+import { type ApiKey, NO_AUTH_SENTINEL, withAuth } from "../auth-retry";
 import * as AIError from "../error";
 import { validateImageInput } from "../images/shared";
 import { withInferenceUserAgent } from "../providers/inference-headers";
@@ -553,13 +554,20 @@ export class NativeJudge implements Judge {
 		signal: AbortSignal | undefined,
 		requestHeaders: Readonly<Record<string, string>> | undefined,
 	): Promise<unknown> {
-		const target = this.#wire.target(this.baseUrl, this.model, key);
+		// The keyless marker must never reach an authentication header: OpenCode's
+		// free lanes expect the literal `public` credential, and every other
+		// transport must send no credential at all rather than `Bearer N/A`.
+		const credential =
+			key === NO_AUTH_SENTINEL ? (isOpenCodeProvider(this.provider) ? OPENCODE_PUBLIC_KEY : "") : key;
+		const target = this.#wire.target(this.baseUrl, this.model, credential);
 		const headers: Record<string, string> = {
 			...this.#headers,
 			...requestHeaders,
-			...(target.tokenHeader === undefined
-				? { Authorization: `Bearer ${target.token}` }
-				: { [target.tokenHeader]: target.token }),
+			...(target.token === ""
+				? {}
+				: target.tokenHeader === undefined
+					? { Authorization: `Bearer ${target.token}` }
+					: { [target.tokenHeader]: target.token }),
 			Accept: "application/json",
 			"Content-Type": "application/json",
 		};

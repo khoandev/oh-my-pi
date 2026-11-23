@@ -60,6 +60,7 @@ import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-refere
 import { withThinkingCapability } from "@oh-my-pi/pi-catalog/thinking-capability";
 import { apiServesKind, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
+import { isOpenCodeProvider } from "@oh-my-pi/pi-catalog/wire/opencode";
 import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
@@ -4004,8 +4005,9 @@ export class ModelRegistry {
 	 * external plugins/extensions and downstream wrappers (e.g. subagent launch
 	 * paths that pre-flight auth before model resolution) can probe a model
 	 * without resolving an API key. Returns true for keyless providers, for
-	 * providers whose transport authenticates without a key (OpenCode Zen's
-	 * anonymous `public` free tier), and for providers with stored credentials.
+	 * providers whose transport authenticates the selected model without a key
+	 * (OpenCode Zen's anonymous `public` free tier only), and for providers with
+	 * stored credentials.
 	 * See issue #993.
 	 *
 	 * Side-effect-free and synchronous: a command-backed key (`!cmd`) counts as
@@ -4025,7 +4027,7 @@ export class ModelRegistry {
 		return (
 			keyConfig !== undefined ||
 			this.#keylessProviders.has(model.provider) ||
-			this.#allowsMissingApiKey(model.provider) ||
+			this.#allowsMissingApiKey(model) ||
 			this.authStorage.keys.source(model.provider, { env: "aliases" }) !== undefined ||
 			this.authStorage.keys.keyless(model.provider)
 		);
@@ -4208,9 +4210,14 @@ export class ModelRegistry {
 		);
 	}
 
-	/** Transport authenticates without a resolved key (e.g. Zen's anonymous free tier). */
-	#allowsMissingApiKey(provider: string): boolean {
-		return getProviderDefinition(provider)?.allowsMissingApiKey === true;
+	/**
+	 * Transport authenticates without a resolved key (e.g. Zen's anonymous free
+	 * tier). OpenCode gateways accept their `public` credential only on free
+	 * models, so a paid lane still needs a real key.
+	 */
+	#allowsMissingApiKey(model: Pick<Model<Api>, "provider" | "cost">): boolean {
+		if (getProviderDefinition(model.provider)?.allowsMissingApiKey !== true) return false;
+		return !isOpenCodeProvider(model.provider) || !model.cost?.input;
 	}
 
 	/** Resolve a model's request credential or the no-auth sentinel. */
@@ -4235,7 +4242,7 @@ export class ModelRegistry {
 		// inline, so a provider with no stored or env credential resolves the
 		// no-auth sentinel instead of failing the prompt preflight before the
 		// wire layer can inject its own credential.
-		if (apiKey === undefined && this.#allowsMissingApiKey(model.provider)) return kNoAuth;
+		if (apiKey === undefined && this.#allowsMissingApiKey(model)) return kNoAuth;
 		return apiKey;
 	}
 
@@ -4293,7 +4300,8 @@ export class ModelRegistry {
 		if (this.#isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };
 		}
-		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;
+		const model = options?.modelId ? this.find(provider, options.modelId) : undefined;
+		const accountAccess = model?.accountAccess;
 		const resolved = await this.authStorage.keys.getWithCredential(provider, sessionId, {
 			baseUrl: options?.baseUrl,
 			modelId: options?.modelId,
@@ -4303,7 +4311,13 @@ export class ModelRegistry {
 			rejectedAccessToken: options?.rejectedAccessToken,
 			signal: options?.signal,
 		});
-		if (resolved === undefined && this.#allowsMissingApiKey(provider)) return { apiKey: kNoAuth };
+		// A provider-scoped call without a model cannot tell a free lane from a
+		// paid one, so it keeps the provider-level answer; model-aware callers
+		// (resolver(model), the judge and hint compressors) get the free-tier gate.
+		const allowsMissing = model
+			? this.#allowsMissingApiKey(model)
+			: getProviderDefinition(provider)?.allowsMissingApiKey === true;
+		if (resolved === undefined && allowsMissing) return { apiKey: kNoAuth };
 		return resolved;
 	}
 

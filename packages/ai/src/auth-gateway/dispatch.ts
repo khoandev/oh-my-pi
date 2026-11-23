@@ -7,6 +7,7 @@
  * Everything credential-shaped lives here so each route drives the same
  * broker-backed rotation policy and the same usage ledger.
  */
+import { isOpenCodeProvider } from "@oh-my-pi/pi-catalog/wire/opencode";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
 	type ApiKeyResolver,
@@ -142,7 +143,12 @@ export async function resolveGatewayApiKey(
 		return classified;
 	}
 	if (apiKey) return apiKey;
-	if (getProviderDefinition(model.provider)?.allowsMissingApiKey) return { apiKey: NO_AUTH_SENTINEL };
+	if (getProviderDefinition(model.provider)?.allowsMissingApiKey) {
+		// OpenCode gateways authenticate their free lanes with the `public`
+		// credential only; a paid lane must fail here with a clear auth error
+		// instead of sending a keyless request upstream.
+		if (!isOpenCodeProvider(model.provider) || !model.cost?.input) return { apiKey: NO_AUTH_SENTINEL };
+	}
 	return {
 		status: 401,
 		type: "authentication_error",

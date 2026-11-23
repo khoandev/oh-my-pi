@@ -12,6 +12,7 @@ import {
 	JudgmentApiError,
 	JudgmentParseError,
 	NativeJudge,
+	NO_AUTH_SENTINEL,
 	parseChoiceReply,
 	parseNoulReply,
 	parseScoreReply,
@@ -345,6 +346,40 @@ describe("NativeJudge", () => {
 		expect(result.model).toBe("jev-latest");
 		expect(result.usage.input).toBe(5);
 		expect(result.usage.totalTokens).toBe(6);
+	});
+
+	it("sends the public credential for a no-auth OpenCode free lane", async () => {
+		const authorizations: Array<string | null> = [];
+		const judge = new NativeJudge({
+			apiKey: NO_AUTH_SENTINEL,
+			provider: "opencode-zen",
+			model: "jev-1.13-free",
+			baseUrl: "https://opencode.ai/zen",
+			fetch: async (_url, init) => {
+				authorizations.push(new Headers(init?.headers).get("authorization"));
+				return answered();
+			},
+		});
+
+		await judge.judge(request);
+
+		expect(authorizations).toEqual(["Bearer public"]);
+	});
+
+	it("never sends the no-auth sentinel as a bearer", async () => {
+		const authorizations: Array<string | null> = [];
+		const judge = new NativeJudge({
+			apiKey: NO_AUTH_SENTINEL,
+			provider: "self-hosted",
+			fetch: async (_url, init) => {
+				authorizations.push(new Headers(init?.headers).get("authorization"));
+				return answered();
+			},
+		});
+
+		await judge.judge(request);
+
+		expect(authorizations).toEqual([null]);
 	});
 
 	it("redacts credentials from the state under an active redaction policy", async () => {

@@ -444,6 +444,41 @@ describe("ModelRegistry", () => {
 		expect(registry.hasConfiguredAuth(keylessModel)).toBe(true);
 	});
 
+	test("does not report configured auth for a paid lane on a keyless transport provider", async () => {
+		const paidModel = buildModel({
+			id: "deepseek-v4.1-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			provider: "opencode-zen",
+			baseUrl: "https://opencode.ai/zen/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0.12, output: 0.4, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+		});
+
+		expect(registry.hasConfiguredAuth(paidModel)).toBe(false);
+		expect(await registry.getApiKey(paidModel)).toBeUndefined();
+	});
+
+	test("does not treat unauthenticated-only discovery providers as configured", () => {
+		const vertexModel = buildModel({
+			id: "gemini-2.5-pro",
+			name: "Gemini 2.5 Pro",
+			api: "google-vertex",
+			provider: "google-vertex",
+			baseUrl: "https://us-central1-aiplatform.googleapis.com",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+		});
+
+		expect(registry.hasConfiguredAuth(vertexModel)).toBe(false);
+	});
+
 	test("maps legacy extension auth failures into the result contract", async () => {
 		const model = testModel;
 		vi.spyOn(registry, "getApiKey").mockRejectedValue(new Error("auth failed"));

@@ -451,31 +451,16 @@ export class ModelControls {
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
 	}
 
-	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
-		const apiKeysByProvider = new Map<string, string | undefined>();
-		const result: Array<{ model: Model; thinkingLevel?: ThinkingLevel }> = [];
-
-		for (const scoped of this.scopedModels) {
-			const provider = scoped.model.provider;
-			let apiKey: string | undefined;
-			if (apiKeysByProvider.has(provider)) {
-				apiKey = apiKeysByProvider.get(provider);
-			} else {
-				apiKey = await this.#host.modelRegistry.getApiKeyForProvider(provider, this.#host.sessionId());
-				apiKeysByProvider.set(provider, apiKey);
-			}
-
-			if (apiKey) {
-				result.push(scoped);
-			}
-		}
-
-		return result;
+	#getScopedModelsWithApiKey(): Array<{ model: Model; thinkingLevel?: ThinkingLevel }> {
+		// Model-aware: a provider whose transport is keyless only on its free
+		// tier must not put a paid lane into the cycle, where the switch would
+		// land and the request would 401.
+		return this.scopedModels.filter(scoped => this.#host.modelRegistry.hasConfiguredAuth(scoped.model));
 	}
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
-		const scopedModels = await this.#getScopedModelsWithApiKey();
+		const scopedModels = this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
 
 		let currentIndex = findScopedModelIndex(scopedModels, this.#model);
