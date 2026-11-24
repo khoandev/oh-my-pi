@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `AssistantMessage.errorFromAgentLoop`, set when the agent loop rather than the provider ended the turn with the error ([#20336](https://github.com/can1357/oh-my-pi/pull/20336) by [@baekjosh](https://github.com/baekjosh))
+
 ### Fixed
 
 - Native judges and prompted judgments on OpenCode Zen's anonymous free tier now send the `public` credential instead of a `Bearer N/A` request that returns `401 Invalid credential`; the auth gateway also rejects a paid OpenCode lane without a credential instead of sending it keyless

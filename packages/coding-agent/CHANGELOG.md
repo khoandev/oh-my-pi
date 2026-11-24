@@ -15,6 +15,7 @@
 ### Added
 
 - The subagents HUD mutes the status mark, and tray cards mark, subagents that are only waiting on their own agents or jobs (`wait`, `vibe_wait`), so they stand apart from subagents doing work
+- Retry fallbacks now record why they switched models on the fallback's `model_change` entry: the model left, the trigger (`request-error`, `agent-loop`, `usage-preflight`, or `missing-credential`), and the error or condition. A fallback after the agent loop stopped a turn itself, such as a soft tool requirement the model never met, is announced as `Turn stopped: …` instead of `Request failed: …` ([#20336](https://github.com/can1357/oh-my-pi/pull/20336) by [@baekjosh](https://github.com/baekjosh))
 - The bash tool now runs `cmd <<'EOF' && \` as meant: the stray `\` that pushed the heredoc body below the next line (running that line as a command) is dropped, with a notice, when the result parses
 - Tray cards now mark subagents that are only waiting on their own agents or jobs (`wait`, `vibe_wait`), so Tern shows them apart from subagents doing work
 - The shell's `tail -r` builtin now takes `-c`, `-b`, and `+N` counts like BSD `tail`, and `tail -b N` selects 512-byte blocks; `-r` with `-f` is BSD's usage error instead of a "pipe through tac" refusal
@@ -70,6 +71,8 @@
 - An MCP tool call refused with HTTP 403 `insufficient_scope` now asks you to authorize the missing scope, keeping the scopes already granted, and retries the call once after you approve; declining shows the 403 ([#20340](https://github.com/can1357/oh-my-pi/issues/20340))
 - `omp models refresh` now warns when Alibaba Token Plan discovery fails instead of silently listing fallback models ([#20343](https://github.com/can1357/oh-my-pi/issues/20343)).
 - Switching models while auto thinking is still classifying a prompt no longer gives the new model the previous model's effort ([#20310](https://github.com/can1357/oh-my-pi/pull/20310) by [@taibenvenuti](https://github.com/taibenvenuti))
+- A retry no longer runs a tool call that was refused while a preview was pending, whether the turn gave up after three forced `resolve` turns or the request after the refusal failed, and whether the retry switched to a fallback model or you retried by hand ([#20338](https://github.com/can1357/oh-my-pi/pull/20338) by [@baekjosh](https://github.com/baekjosh))
+- Fixed a pending preview telling the model to call `bash` again when its `bash` command ran something other than `resolve` or `reject` (such as `ast_edit resolve …`); the skipped call now names the command it ran and says the command must be `resolve` or `reject` ([#20335](https://github.com/can1357/oh-my-pi/pull/20335) by [@baekjosh](https://github.com/baekjosh))
 - Tern no longer loses the tray's dots when the working line above the composer comes and goes: the line stays one row instead of turning into an empty column while idle
 - In the bash tool on macOS, `ls -lT` shows full timestamps instead of failing with `invalid tab size`, `uptime` prints macOS's format, and `chmod +a` and the other ACL forms run `/bin/chmod`.
 - The bash tool's `top -l` now reports load averages, user/sys/idle CPU and usernames, and `ps` shows start and elapsed times for other users' processes such as pid 1.
