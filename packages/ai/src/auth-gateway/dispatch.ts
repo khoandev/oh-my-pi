@@ -20,7 +20,14 @@ import {
 import type { AuthApiKeyOptions, AuthStorage } from "../auth-storage";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { getProviderDefinition } from "../registry";
-import type { Api, FetchImpl, Model, Usage } from "../types";
+import {
+	type Api,
+	type FetchImpl,
+	type Model,
+	type ServiceTier,
+	serviceTierOffersByAccount,
+	type Usage,
+} from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import type { AuthGatewayClientScope } from "./clients";
 import type { AuthGatewayServerOptions } from "./types";
@@ -121,7 +128,8 @@ export function gatewayRequestLogFields(
  * Keep this selection snapshot intact even if another request replaces the
  * stored token before dispatch. Storage failures map through
  * {@link classifyGatewayError}; a provider without any credential is a 401
- * unless its catalog policy allows keyless requests.
+ * unless its catalog policy allows keyless requests. `serviceTier` is the tier
+ * the request asks for, so the credential is one that offers it when any does.
  */
 export async function resolveGatewayApiKey(
 	opts: AuthGatewayCredentialOptions,
@@ -129,13 +137,14 @@ export async function resolveGatewayApiKey(
 	sessionId: string,
 	signal: AbortSignal,
 	peer: string,
+	serviceTier?: ServiceTier,
 ): Promise<ResolvedApiKey | GatewayErrorClassification> {
 	let apiKey: ResolvedApiKey | undefined;
 	try {
 		apiKey = await opts.storage.keys.getWithCredential(
 			model.provider,
 			gatewayCredentialSessionId(opts, model, sessionId),
-			modelKeyOptions(model, signal),
+			modelKeyOptions(model, signal, serviceTier),
 		);
 	} catch (error) {
 		const classified = classifyGatewayError(error);
@@ -175,6 +184,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 	signal: AbortSignal,
 	format: string,
 	peer: string,
+	serviceTier: ServiceTier | undefined,
 ): Promise<ResolvedApiKey | undefined> {
 	const rotation = await storage.limits.rotate(provider, sessionId, {
 		error,
@@ -193,13 +203,22 @@ async function refreshGatewayApiKeyAfterAuthError(
 		error: error instanceof Error ? error.message : String(error),
 	});
 	return resolveAfterRotation(rotation, error, () =>
-		storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal)),
+		storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal, serviceTier)),
 	);
 }
 
-/** Model-scoped key options: usage ranking by model id, routing to accounts discovery saw serve it. */
-function modelKeyOptions(model: Model<Api>, signal: AbortSignal): AuthApiKeyOptions {
-	return { modelId: model.id, accountIds: model.accountAccess && Object.keys(model.accountAccess), signal };
+/**
+ * Model-scoped key options: usage ranking by model id, routing to accounts
+ * discovery saw serve it, and a preference for those offering `serviceTier`.
+ */
+function modelKeyOptions(model: Model<Api>, signal: AbortSignal, serviceTier?: ServiceTier): AuthApiKeyOptions {
+	return {
+		modelId: model.id,
+		accountIds: model.accountAccess && Object.keys(model.accountAccess),
+		serviceTier,
+		serviceTierAccounts: serviceTierOffersByAccount(model, serviceTier),
+		signal,
+	};
 }
 
 /**
@@ -237,7 +256,7 @@ export function buildGatewayApiKeyResolver(
 	// token a 401 rejected is looked up from the bearer that request sent.
 	const provenance = createOAuthProvenance();
 	provenance.record(initialKey);
-	return async ({ lastChance, error, signal, previousKey }) => {
+	return async ({ lastChance, error, signal, previousKey, serviceTier }) => {
 		if (initialKey.apiKey === NO_AUTH_SENTINEL && initialKey.credentialId === undefined) {
 			return error === undefined ? initialKey : undefined;
 		}
@@ -254,7 +273,7 @@ export function buildGatewayApiKeyResolver(
 				model.provider,
 				gatewayCredentialSessionId(opts, model, sessionId),
 				{
-					...modelKeyOptions(model, sig),
+					...modelKeyOptions(model, sig, serviceTier),
 					forceRefresh: true,
 					refreshReason: refreshReasonFor(error),
 					rejectedAccessToken,
@@ -275,6 +294,7 @@ export function buildGatewayApiKeyResolver(
 			sig,
 			format,
 			peer,
+			serviceTier,
 		);
 		provenance.record(next);
 		lastKey = next?.apiKey ?? lastKey;
