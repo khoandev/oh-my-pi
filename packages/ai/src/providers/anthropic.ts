@@ -4161,8 +4161,12 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	// account keys on the paid lanes of the same provider keep working. An
 	// anonymous login resolves to the `N/A` no-auth sentinel; treat it as no
 	// key so the free-tier public credential is injected instead of `N/A`.
-	const configured = configuredApiKey === NO_AUTH_SENTINEL ? "" : configuredApiKey;
-	const apiKey = configured || (requiresOpenCodeEnvironment(model) ? OPENCODE_PUBLIC_KEY : "");
+	// Every other keyless route keeps the sentinel: header builders use it to
+	// send no credential at all rather than an empty `Bearer `.
+	const isKeyless = configuredApiKey === NO_AUTH_SENTINEL;
+	const configured = isKeyless ? "" : configuredApiKey;
+	const apiKey =
+		configured || (requiresOpenCodeEnvironment(model) ? OPENCODE_PUBLIC_KEY : isKeyless ? NO_AUTH_SENTINEL : "");
 	const compat = model.compat;
 	const disableStrictTools = disableStrictToolsOverride ?? compat.disableStrictTools;
 	const baseUrl = resolveAnthropicBaseUrl(model, apiKey);
