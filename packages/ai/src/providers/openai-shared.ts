@@ -15,6 +15,7 @@ import type {
 	VercelGatewayRouting,
 } from "@oh-my-pi/pi-catalog/types";
 import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
+import { parseOtariCredential } from "@oh-my-pi/pi-catalog/wire/otari";
 import { resolveXiaomiRequestBaseUrl } from "../registry/oauth/xiaomi";
 import {
 	COREWEAVE_PROJECT_HEADER,
@@ -196,6 +197,8 @@ export interface OpenAIRequestSetupOptions {
 	};
 	sessionId?: string;
 	promptCacheSessionId?: string;
+	/** Parent conversation of a side request; routes OpenCode's `x-opencode-session` (see `applyInferenceHeaders`). */
+	parentSessionId?: string;
 	/**
 	 * Explicit prompt-cache identity only, never the sessionId fallback:
 	 * callers set it from the already-resolved `promptCacheSessionId` when an
@@ -350,6 +353,13 @@ export function resolveOpenAIRequestSetup(
 		if (credential.baseUrl) baseUrl = credential.baseUrl;
 	}
 
+	if (model.provider === "otari" && options.apiKey) {
+		const credential = parseOtariCredential(rawApiKey);
+		if (!credential) throw new AIError.ConfigurationError("Invalid Otari credential");
+		apiKey = credential.token;
+		if (credential.baseUrl) baseUrl = credential.baseUrl;
+	}
+
 	if (options.alibabaCodingPlanAuth && model.provider === "alibaba-coding-plan") {
 		try {
 			const parsed = JSON.parse(rawApiKey);
@@ -385,6 +395,8 @@ export function resolveOpenAIRequestSetup(
 		cacheAffinity: resolveOpenCodeGoCacheAffinity(model, options.promptCacheAffinityKey),
 		requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 		cwd: options.cwd,
+		parentSessionId: options.parentSessionId,
+		compat: model.compat,
 	});
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);

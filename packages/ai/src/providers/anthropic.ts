@@ -903,6 +903,8 @@ export type AnthropicClientOptionsArgs = {
 	sessionId?: string;
 	/** Conversation working directory, used for the OpenCode project identity. */
 	cwd?: string;
+	/** Parent conversation of a side request; routes OpenCode's `x-opencode-session` (see `applyInferenceHeaders`). */
+	parentSessionId?: string;
 	/** Working-identity cache key for this credential+host; undefined off the Copilot path. */
 	copilotCacheKey?: string;
 	/**
@@ -2311,6 +2313,7 @@ const streamAnthropicOnce = (
 						extractClaudeMetadataSessionId(options?.metadata?.user_id) ??
 						options?.promptCacheKey,
 					cwd: options?.cwd,
+					parentSessionId: options?.parentSessionId,
 					disableStrictTools,
 					dropPromptCacheBetas: dropCacheControl || dropCacheControlOptions,
 				};
@@ -4146,6 +4149,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		omitClaudeCodeAppHeaders,
 		maxRetryDelayMs,
 		sessionId,
+		parentSessionId,
 		disableStrictTools: disableStrictToolsOverride,
 		dropPromptCacheBetas = false,
 		copilotCacheKey,
@@ -4236,6 +4240,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			sessionId,
 			requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 			cwd: args.cwd,
+			parentSessionId,
 		});
 
 		return {
@@ -4311,6 +4316,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		sessionId,
 		requiresOpenCodeClient: requiresOpenCodeEnvironment(model),
 		cwd: args.cwd,
+		parentSessionId,
 	});
 
 	if (model.provider === "cloudflare-ai-gateway") {

@@ -806,6 +806,7 @@ const streamOpenAIResponsesOnce = (
 					// identity; the sessionId-derived cache-id fallback never does.
 					promptCacheAffinityKey: options?.promptCacheKey ? promptCacheSessionId : undefined,
 					cwd: options?.cwd,
+					parentSessionId: options?.parentSessionId,
 				});
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);

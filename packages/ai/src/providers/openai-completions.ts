@@ -1020,6 +1020,7 @@ const streamOpenAICompletionsOnce = (
 				// identity; the sessionId-derived cache-id fallback never does.
 				options?.promptCacheKey ? promptCacheSessionId : undefined,
 				options?.cwd,
+				options?.parentSessionId,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			let appliedStrictTools = false;
@@ -2103,6 +2104,7 @@ function createRequestSetup(
 	sessionId?: string,
 	promptCacheAffinityKey?: string,
 	cwd?: string,
+	parentSessionId?: string,
 ): OpenAIRequestSetup & { baseUrl: string } {
 	const apiVersion = $env.AZURE_OPENAI_API_VERSION || "2024-10-21";
 	const deploymentName = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id) ?? model.id;
@@ -2114,6 +2116,7 @@ function createRequestSetup(
 		sessionId,
 		promptCacheAffinityKey,
 		cwd,
+		parentSessionId,
 		messages: context.messages,
 		defaultBaseUrl: "https://api.openai.com/v1",
 		// Provider auth/header overlay: Kimi-code hosts require shared client
