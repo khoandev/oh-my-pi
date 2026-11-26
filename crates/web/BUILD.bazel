@@ -10,7 +10,6 @@ rust_library(
     lint_config = "//bazel/lints:workspace_lints",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
-    # include_str! input: the Grok `x_search` prompt used by sites/twitter.rs.
     compile_data = glob(["src/**/*.md"]),
     crate_name = "omp_web",
     edition = "2024",

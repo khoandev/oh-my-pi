@@ -1559,6 +1559,16 @@ export interface ModelCost extends TokenCost {
 	timeBased?: TimeBasedCost;
 }
 
+/** A model's fast lane on a host that serves it under separate wire ids; see {@link Model.priorityLane}. */
+export interface PriorityLane {
+	/** Logical id the lane was listed under; `buildModel` prices it under this id's catalog rules. */
+	id: string;
+	/** Standard wire id → the same model's fast-lane wire id. Wire ids without an entry run at standard speed. */
+	routes: Readonly<Record<string, string>>;
+	/** Lane rate card. */
+	cost: ModelCost;
+}
+
 /**
  * Exact local content tokenizer family for a model.
  *
@@ -1685,6 +1695,13 @@ export interface Model<TApi extends Api = Api> {
 	 */
 	requestModelId?: string;
 	/**
+	 * Fast lane served under its own wire ids rather than a request field
+	 * (Devin's `-fast` / `-priority` / `-lightning` uids). Discovery folds the
+	 * lane's row into this one; the `priority` service tier (`/fast`) sends the
+	 * routed wire id and bills the lane's card.
+	 */
+	priorityLane?: PriorityLane;
+	/**
 	 * `reasoning.mode` to send on OpenAI Responses-family requests. Set on
 	 * generated pro aliases (`gpt-5.6-*-pro` on `openai`/`openai-codex`) that
 	 * pair a base wire id (`requestModelId`) with OpenAI's pro reasoning
@@ -1797,12 +1814,6 @@ export interface Model<TApi extends Api = Api> {
 	/** Canonical organization resolved during Factory discovery. */
 	factoryDroidOrgId?: string;
 	cost: ModelCost;
-	/**
-	 * Fast-lane twin that `/fast` (the priority service tier) routes to: each
-	 * standard wire id maps to the lane's uid, billed at the lane's card.
-	 * Populated by discovery that folds `-fast` rows into their base model.
-	 */
-	priorityLane?: { id: string; routes: Readonly<Record<string, string>>; cost: ModelCost };
 	/**
 	 * Prompt-cache entry lifetime per retention tier, in seconds. Populated only
 	 * for providers whose cache-expiry and replay behavior has been validated

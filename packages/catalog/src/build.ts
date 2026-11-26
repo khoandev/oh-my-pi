@@ -536,22 +536,11 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 	applyCatalogAssignments(model, policy.catalog);
 	applyCatalogCorrections(model, policy.catalog);
 	capAntigravityWireProfiles(model, policy.catalog.maxTokensCeiling);
-	// A folded fast lane prices under its own listed id's rules, not the base row's.
-	const lane = spec.priorityLane;
-	if (lane !== undefined) {
-		const laneCatalog = resolveModelPolicy({ ...spec, id: lane.id }).catalog;
-		model.priorityLane = {
-			...lane,
-			cost: correctedCost(
-				lane.cost,
-				laneCatalog,
-				{
-					patch: parseDatedCostCards(laneCatalog.costPatch, "cost-patch"),
-					fallback: parseDatedCostCards(laneCatalog.costFallback, "cost-fallback"),
-				},
-				Date.now(),
-			),
-		};
+	if (spec.priorityLane !== undefined) {
+		// The lane bills under its own listed id's rules (cache-write rate,
+		// long-context tier, dated cards), as its standalone row did.
+		const { priorityLane: lane, requestModelId: _, ...standard } = spec;
+		model.priorityLane = { ...lane, cost: buildModel({ ...standard, id: lane.id, cost: lane.cost }).cost };
 	}
 	// Configured kinds and lifetimes replace catalog values rather than merging with them.
 	if (spec.kindConfig !== undefined) model.kind = spec.kindConfig;
