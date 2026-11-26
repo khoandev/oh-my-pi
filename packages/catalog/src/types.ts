@@ -1798,6 +1798,12 @@ export interface Model<TApi extends Api = Api> {
 	factoryDroidOrgId?: string;
 	cost: ModelCost;
 	/**
+	 * Fast-lane twin that `/fast` (the priority service tier) routes to: each
+	 * standard wire id maps to the lane's uid, billed at the lane's card.
+	 * Populated by discovery that folds `-fast` rows into their base model.
+	 */
+	priorityLane?: { id: string; routes: Readonly<Record<string, string>>; cost: ModelCost };
+	/**
 	 * Prompt-cache entry lifetime per retention tier, in seconds. Populated only
 	 * for providers whose cache-expiry and replay behavior has been validated
 	 * for cache warming (direct Anthropic: 5m / 1h). A missing entry means the
