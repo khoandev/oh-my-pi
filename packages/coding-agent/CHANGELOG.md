@@ -14,6 +14,7 @@
 
 ### Added
 
+- Credentials in `agent.db` can be encrypted with a master key kept in the OS credential vault (macOS Keychain, Windows Credential Manager, Secret Service): fresh installs encrypt when the vault answers without prompting (never on headless hosts), existing unencrypted stores stay as they are, and `auth.encrypt: true`/`false` (or `OMP_AUTH_ENCRYPT`) forces it on or off; `omp auth key` prints the master key and `omp auth key <key|->` installs one, re-encrypting stored credentials under it
 - Added OSC 7577 Program Resume Protocol reporting so supporting terminals (Tern, Rex, etc.) automatically restore open omp sessions with `--restore` and their launch flags after a crash or restart
 - Added a concise tool display mode, `display.toolActivity: concise`: each model tool call draws as one row with its time, status, tool and intent (`Ctrl+O`, or unfolding a row in Tern, opens the full card, and a failure keeps its last error line on the row); `display.toolActivity` (`detailed`, `concise`, `hidden`) replaces `display.hideToolActivity`, whose saved values migrate, and `Ctrl+Shift+O` now cycles the three modes ([#2785](https://github.com/can1357/oh-my-pi/issues/2785))
 - Added the `wait.idleTimeout` setting: `ladder` (default) keeps today's 5s/4m windows, a duration such as `30m` makes `wait` on your own background jobs and services return a still-running snapshot only after that window, and `none` blocks until a job or service finishes, a message or steering arrives, or you interrupt; waits for a reply are unchanged ([#18485](https://github.com/can1357/oh-my-pi/issues/18485))
@@ -41,6 +42,7 @@
 - The `logout` RPC response carries `signOutError` when the provider could not confirm revoking the login; the login is removed regardless
 - Esc hides the command output (`/mcp` and other slash commands) previewed above the editor while the agent streams, without interrupting the turn; the output still enters the transcript when the agent pauses ([#17954](https://github.com/can1357/oh-my-pi/issues/17954))
 - Added an uninstaller to the install scripts: `curl -fsSL https://omp.sh/install | sh -s -- --uninstall` (PowerShell: `-Uninstall`) removes the installed binary or bun/npm global package and keeps `~/.omp` unless you confirm the prompt or pass `--purge` (`-Purge`) ([#3351](https://github.com/can1357/oh-my-pi/issues/3351))
+- Added `tui.screen: fullscreen`, an opt-in screen mode that draws the session on the alternate screen with the composer, status line and HUD pinned to the bottom while the transcript scrolls inside omp (PageUp/PageDown, Ctrl+Home/Ctrl+End via the new `app.transcript.*` keybindings, and the mouse wheel), following new output unless scrolled back, and writes the whole transcript to the normal screen on exit without erasing the shell's scrollback; `inline` stays the default ([#2040](https://github.com/can1357/oh-my-pi/issues/2040), building on [#2103](https://github.com/can1357/oh-my-pi/pull/2103) by [@shoucandanghehe](https://github.com/shoucandanghehe))
 
 ### Changed
 

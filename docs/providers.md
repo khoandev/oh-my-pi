@@ -6,20 +6,6 @@ A **provider** is the account or backend namespace, such as `anthropic`, `openai
 
 This page covers how providers become available, how credentials are resolved, the provider/environment-variable map, local engines, disabling providers, and custom providers. For native Kiro authentication, model discovery, and streaming, see [Kiro](./kiro.md). For endpoint-specific request, reasoning, tool, stream, usage, and retry constraints, see [Provider endpoint constraints](./provider-endpoint-constraints.md). For model selection and the full `models.yml` schema, see [Model and Provider Configuration](./models.md). For config-file locations and merge precedence, see [Settings](./settings.md). For credential storage and login flows in depth, see [Secrets and credentials](./secrets.md). For the complete environment-variable reference, see [Environment variables](./environment-variables.md). For local engine setup, see [Local models](./local-models.md). For context-file discovery providers, see [Context files](./context-files.md).
 
-## Google AI Ultra plan
-
-The `google-ai-ultra` provider runs Gemini models from Google on your own Google AI Ultra plan. It needs a Google account with an active Google AI Ultra subscription; no API key is involved.
-
-1. Run `/login google-ai-ultra` (listed as "Sign in with Google (AI Ultra)") or `omp login google-ai-ultra`.
-2. Approve the sign-in in your browser. A sign-in lasts 7 days, then sign in again.
-3. Select a model, for example `google-ai-ultra/gemini-4-hydrogen` (the default), and send a prompt.
-
-Requests count against the plan's daily limits, which Google keeps separately for each model (Gemini 4 Hydrogen, Gemini 4 Neon, Gemini 4 Carbon, Gemini 3.5 Flash-Lite). When one model's daily limit is reached, `omp` reports when it resets and the other models stay available; it does not retry that model until the reset. With several signed-in Google accounts, a turn moves to the next account when one account has no eligible plan or has spent that model's daily limit. Each model exposes Google's own thinking levels (`xhigh` on Hydrogen and Neon, `minimal` on Flash-Lite).
-
-The sign-in belongs to the machine that started it. Google binds it to a key generated there, so the refresh token and that key stay in the OS credential vault (macOS Keychain, Windows Credential Manager, a Secret Service keyring on Linux; on hosts without one, an owner-only file under `~/.omp/agent/vault/`) and never reach a shared auth broker. On a remote machine or over SSH, run the login there: open the printed URL in your local browser, then paste the final `127.0.0.1` address from the browser's address bar back into `omp` (or forward the printed port with `ssh -L`). Copying credentials from another machine does not work.
-
-`/logout google-ai-ultra` offers two actions per account: **Sign out on this device** deletes the sign-in from this machine only, and **Disconnect Google Account** also revokes it at Google, ending it on every device. If Google cannot confirm the revocation, `omp` still deletes the local copy; remove `omp` at [Google Account Connections](https://myaccount.google.com/connections).
-
 ## Factory Droid
 
 The `factory-droid` provider uses Factory's Droid subscription gateway directly. No `droid` binary, daemon, or SDK subprocess is needed for login or inference.
@@ -79,6 +65,10 @@ When a provider needs an API key, `omp` resolves it in this order (first match w
 7. **Other stored API key**: for example, a broker-migrated key. This is a last resort so an explicit environment variable wins.
 
 Local credentials live in the active auth store (default: `~/.omp/agent/agent.db`); broker mode uses the configured shared auth broker. Named profiles and Linux XDG layouts can relocate the store. In the default profile, `PI_CODING_AGENT_DIR` overrides the agent directory. See [Settings](./settings.md) and [Secrets and credentials](./secrets.md) for path resolution.
+
+### Credential storage
+
+Credentials in `agent.db` can be encrypted (AES-256-GCM, a fresh salt per credential) under a master key kept in the OS credential vault: macOS Keychain, Windows Credential Manager, or a Secret Service keyring on Linux. By default a store keeps its mode: an existing unencrypted store stays unencrypted, an encrypted one keeps encrypting, and a fresh store encrypts when the vault answers without prompting. Headless hosts (SSH sessions, CI, Linux without a display) never use the vault on their own. Set `auth.encrypt: true` in `config.yml` (or `OMP_AUTH_ENCRYPT=1`) to encrypt new credentials, or `false` to stop; credentials already encrypted stay readable while the vault holds the key. Copying `agent.db` to another machine leaves its encrypted credentials unreadable there unless that machine gets the same key: `omp auth key` prints it, and `omp auth key -` reads one from stdin, stores it in the vault, and re-encrypts the machine's credentials under it (`omp auth key | ssh host omp auth key -`). In broker mode, the broker host encrypts its own store.
 
 ### OAuth vs API key, and provider-scoped logins
 
