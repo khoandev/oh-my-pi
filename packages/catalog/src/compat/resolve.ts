@@ -1008,19 +1008,14 @@ function resolveDevinPolicy(spec: ModelSpec<"devin-agent">, axes: ResolvedAxes):
 }
 
 function resolveGooglePolicy(
-	spec: ModelSpec<"google-generative-ai" | "google-vertex" | "google-gemini-cli">,
+	spec: ModelSpec<"google-generative-ai" | "google-vertex">,
 	axes: ResolvedAxes,
 ): ResolvedGoogleCompat {
 	const compat: ResolvedGoogleCompat = {
 		supportsFunctionPartId: false,
 		requiresSkipThoughtSignature: false,
 		requiresSkipThoughtSignatureOnFirstFunctionCall: false,
-		dropUnsignedThinking: false,
-		ccaLegacyParametersSchema: false,
 		multimodalFunctionResponse: false,
-		flashStreamLeakWorkaround: false,
-		claudeThinkingBetaHeader: false,
-		antigravityClaudeToolMode: false,
 		stripImageInput: false,
 		// Unset means "no image contract": images go out as sent. Keys exist so
 		// a KDL rule or a user `compat` block can declare one.
@@ -1066,7 +1061,6 @@ const FIREWORKS_THINKING_EFFORT_MAP: Readonly<Partial<Record<Effort, string>>> =
 function defaultThinkingMode<TApi extends Api>(spec: ModelSpec<TApi>, facts: IdentityFacts): ThinkingConfig["mode"] {
 	switch (spec.api) {
 		case "google-generative-ai":
-		case "google-gemini-cli":
 		case "google-vertex":
 			// Gemini 3+ `google-level` is a `thinking-mode` rule in classes/gemini.kdl.
 			return "budget";
@@ -1220,8 +1214,7 @@ function resolveThinkingPolicy<TApi extends Api>(
 			spec.api === "azure-openai-responses" ||
 			spec.api === "anthropic-messages" ||
 			spec.api === "google-generative-ai" ||
-			spec.api === "google-vertex" ||
-			spec.api === "google-gemini-cli";
+			spec.api === "google-vertex";
 		if ((spec.kind ?? "chat") !== "chat" || (!supportedApi && rule.unverified !== true)) return undefined;
 		return {
 			mode: rule.mode ?? defaultThinkingMode(spec, facts),
@@ -1430,11 +1423,7 @@ export function resolveModelPolicy(input: ModelSpec<Api>, route?: ResolveRoute):
 		compat = resolveOllamaPolicy(spec, axes);
 	} else if (specUsesApi(spec, "devin-agent")) {
 		compat = resolveDevinPolicy(spec, axes);
-	} else if (
-		specUsesApi(spec, "google-generative-ai") ||
-		specUsesApi(spec, "google-vertex") ||
-		specUsesApi(spec, "google-gemini-cli")
-	) {
+	} else if (specUsesApi(spec, "google-generative-ai") || specUsesApi(spec, "google-vertex")) {
 		compat = resolveGooglePolicy(spec, axes);
 	} else {
 		compat = undefined;

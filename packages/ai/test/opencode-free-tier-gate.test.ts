@@ -203,9 +203,11 @@ describe("OpenCode free-tier error rewrite", () => {
 		const rewritten = await formatMessage(new Error(raw), { provider: "opencode-zen" });
 		expect(rewritten).toMatch(/FreeTierError/);
 		expect(rewritten).toMatch(/free tier can only be used from within/i);
-		expect(rewritten).toMatch(/paid models on the same key keep working/);
-		// Untouched for other providers: the wording is not globally unique.
-		expect(await formatMessage(new Error(raw), { provider: "openai" })).toBe(raw);
+		expect(rewritten).toMatch(/your key still works for paid Zen models/);
+		// Matched on the provider's text, not the provider id, so custom
+		// providers fronting Zen get the explanation too.
+		expect(await formatMessage(new Error(raw), { provider: "openai" })).toBe(rewritten);
+		expect(await formatMessage(new Error("500 upstream boom"), { provider: "openai" })).toBe("500 upstream boom");
 	});
 });
 

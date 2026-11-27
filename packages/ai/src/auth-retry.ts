@@ -10,7 +10,7 @@ import type {
 import type { ServiceTier } from "./types";
 import * as AIError from "./error";
 import { isAuthRetryableError, isInvalidatedOAuthTokenError, isRevokedOAuthBearerError } from "./error/auth-classify";
-import { isAccountPolicyError, isOpencodeFreeTierGateMessage, isUsageLimit } from "./error/flags";
+import { isAccountPolicyError, isOpenCodeFreeTierGateMessage, isUsageLimit } from "./error/flags";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
 
 /**
@@ -261,7 +261,7 @@ function isDirectCredentialRotationError(error: unknown): boolean {
 	// sibling before the caller's backoff layer can retry it. OpenCode's
 	// free-tier gate denial is model-scoped client policy: sibling keys fail
 	// identically, and the credential keeps serving paid SKUs.
-	if (isForbidden && !isConcurrencyCapExclusion(status, message) && !isOpencodeFreeTierGateMessage(message))
+	if (isForbidden && !isConcurrencyCapExclusion(status, message) && !isOpenCodeFreeTierGateMessage(message))
 		return true;
 	return isUsageLimitOutcome(status, message);
 }
