@@ -16,7 +16,6 @@
 
 ### Added
 
-- Added `app.display.hold` (`Alt+S`): holds all output so a streaming turn stops scrolling the screen while you read back through native scrollback; any key resumes and catches up in one frame ([#19751](https://github.com/can1357/oh-my-pi/pull/19751) by [@LangYa466](https://github.com/LangYa466)).
 - Added `--preset <name>` to start a session on a saved model preset (`/modelpreset save`), applying its roles and default thinking level for that run only ([#20306](https://github.com/can1357/oh-my-pi/pull/20306) by [@nick-maderight](https://github.com/nick-maderight))
 - Credentials in `agent.db` can be encrypted with a master key kept in the OS credential vault (macOS Keychain, Windows Credential Manager, Secret Service): fresh installs encrypt when the vault answers without prompting (never on headless hosts), existing unencrypted stores stay as they are, and `auth.encrypt: true`/`false` (or `OMP_AUTH_ENCRYPT`) forces it on or off; `omp auth key` prints the master key and `omp auth key <key|->` installs one, re-encrypting stored credentials under it
 - Added OSC 7577 Program Resume Protocol reporting so supporting terminals (Tern, Rex, etc.) automatically restore open omp sessions with `--restore` and their launch flags after a crash or restart
@@ -28,6 +27,7 @@
 - `/fast` now switches Devin models onto their fast lanes, replacing the separate Devin Fast model entries; set `tier.devin: priority` to start every session in fast mode
 - The glob tool's header shows the globs a call searches, a separate `pattern` included, with wildcards, character classes and `{a,b}` alternations highlighted like grep's regex ([#20616](https://github.com/can1357/oh-my-pi/pull/20616) by [@JustasMasiulis](https://github.com/JustasMasiulis))
 - Ask forms highlight `<mark>` text, in the terminal and in Tern ([#19559](https://github.com/can1357/oh-my-pi/pull/19559) by [@pavel-kalmykov](https://github.com/pavel-kalmykov))
+- Added `tui.titleSpinner: centered`, a three-dot braille snake (`⠙⠸⢰⣠⣄⡆⠇⠋`) that circles the full cell so it centers on the terminal tab title instead of riding high, and made it the default; `braille` restores the previous `⠋⠙⠹` sweep ([#20729](https://github.com/can1357/oh-my-pi/issues/20729))
 - Added the `gitlab` tool (`gitlab.enabled`, default off) covering project/file/issue reads, MR creation/updating/worktree checkout/push, discussions/notes/resolution, project/group/global search, and CI pipeline/job watching and logs, and expanded `mr://` URLs to support MR listings (`mr://`, `mr://<host>/<group>/<project>`) and cached MR overviews (`mr://<iid>`) alongside existing `/diff` slices ([#20396](https://github.com/can1357/oh-my-pi/pull/20396) by [@asuffield](https://github.com/asuffield))
 - Included `tool_approvals` in `omp gc` stats database session purges ([#20294](https://github.com/can1357/oh-my-pi/pull/20294) by [@asuffield](https://github.com/asuffield))
 - Added `voice` and `speechFormats` to `models.yml` speech models; the `tts` tool switches between MP3 and WAV output to match the formats a model returns ([#19183](https://github.com/can1357/oh-my-pi/pull/19183) by [@Xytronix](https://github.com/Xytronix))
@@ -170,6 +170,17 @@
 - Dictation now warns once when the speech model cannot load on the GPU (e.g. out of VRAM) and falls back to CPU, naming the fallback device and the reason ([#11040](https://github.com/can1357/oh-my-pi/issues/11040))
 - Fixed `wait` guidance sending agents to ask the user to check back later on an outside condition (a CI run, a deploy): the tool description and the back-to-back wait reminder now name one async `bash` watcher that exits once the condition holds, then ending the turn or calling `wait`, and limit the `sleep` job rule to sleeping just to keep calling `wait` ([#18900](https://github.com/can1357/oh-my-pi/issues/18900))
 - RPC mode now writes a `notice` frame with `source: "session-model-restore"` before exiting when a startup `--continue`/`--resume` cannot restore the saved model, so hosts can tell the fail-closed exit from a crash and rebind via `open_session`/`switch_session` with an explicit model ([#17611](https://github.com/can1357/oh-my-pi/issues/17611))
+- Corrected the theme docs: markdown code fences render as `mdCodeBlockBorder`-colored fence rows, not `boxRound.*` frames ([#20111](https://github.com/can1357/oh-my-pi/issues/20111))
+- Fixed routine absolute-path `rm -f` and `rm -r` commands ignoring the bash allow policy in `write` mode; home directories and protected system roots still require approval ([#20241](https://github.com/can1357/oh-my-pi/issues/20241), [#20244](https://github.com/can1357/oh-my-pi/pull/20244) by [@roboomp](https://github.com/roboomp))
+- `omp usage` no longer reports a disabled MCP OAuth login as `re-login to restore` after the server has been logged into again ([#20627](https://github.com/can1357/oh-my-pi/issues/20627))
+- Fixed extensions importing an old-API `@oh-my-pi/pi-tui` subpath (e.g. `@oh-my-pi/pi-tui/prompt/custom-editor`) failing with a misleading `Cannot find package` error, sometimes naming `@oh-my-pi/pi-natives`; the load error now names the unsupported import and the pi-tui migration guide ([#20517](https://github.com/can1357/oh-my-pi/issues/20517))
+- Fixed JPEG and WebP tool-result images (e.g. browser screenshots, auto-resized reads) rendering as `[Image: …]` placeholders instead of inline images ([#20636](https://github.com/can1357/oh-my-pi/issues/20636))
+- Fixed an LSP watched-files crash when a file watcher reports an event without a filename; the watcher now rescans instead of throwing ([#20372](https://github.com/can1357/oh-my-pi/issues/20372))
+- `bash.patterns` `deny`/`prompt` rules and critical-command patterns no longer refuse or prompt a bash line made only of tool commands because a tool's argument text contains the rule's words; each tool is still approved by its own `tools.approval` policy ([#20317](https://github.com/can1357/oh-my-pi/issues/20317))
+- Idle auto-compaction no longer summarizes the conversation while a submitted plan awaits your answer in Plan Review; the idle timer restarts once the review is answered or dismissed ([#20662](https://github.com/can1357/oh-my-pi/issues/20662))
+- Fixed `todo` `init` and `append` accepting non-string task entries (such as phase objects passed in flat `items`) and storing their JSON text as task labels; the call now fails with an error pointing at `list: [{phase, items}]` ([#20669](https://github.com/can1357/oh-my-pi/issues/20669))
+- Fixed `bash script.sh`, `sh -c '…'` and other nested `bash`/`sh` shells in the bash tool skipping their `EXIT` trap when the script ends without `exit`, which left `trap 'rm -rf "$tmp"' EXIT` cleanups undone ([#20047](https://github.com/can1357/oh-my-pi/issues/20047))
+- Documented that extension `getThinkingLevel()` returns `undefined` when the model has no concrete effort (e.g. off/auto-only models on `auto`) ([#20128](https://github.com/can1357/oh-my-pi/issues/20128))
 
 ### Removed
 
@@ -189,6 +200,8 @@
 - Fixed Gemini planning behavior so long tool-free reasoning is not repeatedly interrupted.
 - Fixed ACP and RPC `/mcp` commands to honor project-server precedence, enable/disable overrides, and the session working directory.
 - Fixed unsupported `ANTHROPIC_SEARCH_BASE_URL` from appearing in `omp --help`, and improved the error shown when `bun` is unavailable in compiled JavaScript evaluation.
+- Selective commits now leave HEAD and staging unchanged if the shared index stays locked. Retry once the lock is released ([#20252](https://github.com/can1357/oh-my-pi/issues/20252)).
+- Cache warming no longer sends a refresh after sleep or another timer delay leaves less than ten seconds before cache expiry ([#20366](https://github.com/can1357/oh-my-pi/issues/20366)).
 
 ## [19.2.1] - 2026-11-25
 
