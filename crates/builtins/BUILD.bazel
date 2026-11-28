@@ -17,6 +17,8 @@ rust_library(
         "src/file/magic*",
         # Embedded Perl modules.
         "src/perl/**/*.pm",
+        # `include_bytes!` UCD character-name table for `charnames`.
+        "src/perl/**/*.zst",
         # `include_bytes!` wire captures for the rsync sender tests.
         "src/rsync/sender/testdata/*",
     ]),
