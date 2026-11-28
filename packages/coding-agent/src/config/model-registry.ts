@@ -4608,12 +4608,6 @@ export class ModelRegistry {
 	#createProviderAvailabilityCheck(): (provider: string) => boolean {
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const byProvider = new Map<string, boolean>();
-		const unauthenticated = new Set(
-			PROVIDER_DESCRIPTORS.filter(
-				descriptor =>
-					descriptor.allowUnauthenticated === true || descriptor.catalogDiscovery?.allowUnauthenticated === true,
-			).map(descriptor => descriptor.providerId),
-		);
 		return provider => {
 			let available = byProvider.get(provider);
 			if (available === undefined) {
@@ -4622,19 +4616,32 @@ export class ModelRegistry {
 				// configured-but-keyless: `hasAuth` no longer counts it, but its
 				// models stay usable exactly like an `auth: none` endpoint's
 				// (issue #12281). Implicit local providers are already covered
-				// by `#keylessProviders`. Providers declaring
-				// `allow-unauthenticated` (e.g. OpenCode Zen's `public` free tier)
-				// expose their roster from a clean store with no login at all.
+				// by `#keylessProviders`.
 				available =
 					!disabledProviders.has(provider) &&
-					(unauthenticated.has(provider) ||
-						this.#keylessProviders.has(provider) ||
+					(this.#keylessProviders.has(provider) ||
 						this.authStorage.keys.source(provider) !== undefined ||
 						this.authStorage.keys.keyless(provider));
 				byProvider.set(provider, available);
 			}
 			return available;
 		};
+	}
+
+	/**
+	 * Availability for the model listing/picker: a provider whose transport
+	 * authenticates without a resolved key (e.g. OpenCode Zen's `public` free
+	 * tier) exposes its roster from a clean store with no login at all. Startup
+	 * role resolution deliberately keeps the stricter
+	 * {@link #createProviderAvailabilityCheck} so a free roster can neither
+	 * shadow a configured selector nor force a full cache hydration.
+	 */
+	#createListingAvailabilityCheck(): (provider: string) => boolean {
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		const configured = this.#createProviderAvailabilityCheck();
+		return provider =>
+			!disabledProviders.has(provider) &&
+			(configured(provider) || getProviderDefinition(provider)?.allowsMissingApiKey === true);
 	}
 
 	/**
@@ -4882,7 +4889,7 @@ export class ModelRegistry {
 	 */
 	getAvailableForProviders(providers: ReadonlySet<string>, kind: ModelKind | "all" = "chat"): Model<Api>[] {
 		const requested = new Set([...providers].map(provider => provider.trim().toLowerCase()).filter(Boolean));
-		const isProviderAvailable = this.#createProviderAvailabilityCheck();
+		const isProviderAvailable = this.#createListingAvailabilityCheck();
 		if (this.#hasFullSnapshot) {
 			// Both provider checks once per provider, not per model.
 			const listed = new Map<string, boolean>();
